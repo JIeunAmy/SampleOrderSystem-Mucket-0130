@@ -20,10 +20,10 @@
 | 클래스/모듈 | 계층 | 테스트해야 할 핵심 시나리오 |
 |---|---|---|
 | `Sample` | model | 수율 0~1 범위 검증(경계값 0, 1, 범위 밖 -0.1/1.1 거부), 등록 시 재고 0 시작, 재고 증감 시 음수 방지, **중복 시료 ID 등록 거부**(model_agent phase.md 검증 항목 6), **초기 재고 지정 생성자**(요구사항 변경, 2026-07-15): `Sample(id, name, avgProductionTime, yieldRate, int initialStock = 0)` — 5번째 인자를 생략하면 기존과 동일하게 재고 0에서 시작(하위 호환), 양수를 넘기면 그 값으로 시작, 0을 명시적으로 넘겨도 0에서 시작, 음수를 넘기면 std::invalid_argument. Red 테스트: `SampleOrderSystemTests/SampleTests.cpp`의 "Sample 생성 시 초기 재고를 지정할 수 있다" 테스트 케이스(2026-07-15 Red 확인 — 기존 생성자가 5개 인자를 받지 않아 C2661/C2440 컴파일 실패). model_agent가 이 시그니처로 구현하면 Green 전환. |
-| `Order` | model | 상태 전이 규칙 전부(RESERVED→CONFIRMED/PRODUCING, RESERVED→REJECTED, PRODUCING→CONFIRMED, CONFIRMED→RELEASE), 허용되지 않는 전이 시도(REJECTED에서 재승인/재거절, CONFIRMED에서 재승인, RESERVED/CONFIRMED에서 생산완료 반영 시도, RESERVED에서 출고 시도, RELEASE에서 재출고) 거부, **생산 완료 반영 API 통합 시나리오**(PRODUCING 주문에 대해 완료 반영 API 호출 시 주문 상태가 CONFIRMED로 바뀌는 동시에 해당 Sample 재고가 실 생산량만큼 증가하는지 한 번에 검증). 확정 시그니처: `Order(orderId, customerName, sampleId, quantity)`, `Approve(const Sample&)`(재고>=수량이면 CONFIRMED, 아니면 PRODUCING; RESERVED 아니면 std::logic_error), `Reject()`(RESERVED 아니면 std::logic_error), `CompleteProduction(Sample&, int producedQuantity)`(PRODUCING 아니면 std::logic_error; produce_agent가 계산한 실 생산량을 그대로 Sample 재고에 반영 — quantity_가 아닌 producedQuantity를 받도록 조정한 이유는 실 생산량 `ceil(부족분/수율)`이 주문 수량과 다를 수 있기 때문), `Release()`(CONFIRMED 아니면 std::logic_error). Red 테스트: `SampleOrderSystemTests/OrderTests.cpp` |
+| `Order` | model | 상태 전이 규칙 전부(RESERVED→CONFIRMED/PRODUCING, RESERVED→REJECTED, PRODUCING→CONFIRMED, CONFIRMED→RELEASE), 허용되지 않는 전이 시도(REJECTED에서 재승인/재거절, CONFIRMED에서 재승인, RESERVED/CONFIRMED에서 생산완료 반영 시도, RESERVED에서 출고 시도, RELEASE에서 재출고) 거부, **생산 완료 반영 API 통합 시나리오**(PRODUCING 주문에 대해 완료 반영 API 호출 시 주문 상태가 CONFIRMED로 바뀌는 동시에 해당 Sample 재고가 실 생산량만큼 증가하는지 한 번에 검증). 확정 시그니처: `Order(orderId, customerName, sampleId, quantity)`, `Approve(const Sample&)`(재고>=수량이면 CONFIRMED, 아니면 PRODUCING; RESERVED 아니면 std::logic_error), `Reject()`(RESERVED 아니면 std::logic_error), `CompleteProduction(Sample&, int producedQuantity)`(PRODUCING 아니면 std::logic_error; produce_agent가 계산한 실 생산량을 그대로 Sample 재고에 반영 — quantity_가 아닌 producedQuantity를 받도록 조정한 이유는 실 생산량 `ceil(부족분/수율)`이 주문 수량과 다를 수 있기 때문), **`Release(Sample& sample)`**(2026-07-15 변경, Phase 6: 기존 무인자 `Release()`에서 변경 — CONFIRMED 아니면 std::logic_error(재고 불변), CONFIRMED이면 `sample.DecreaseStock(quantity_)`를 먼저 시도해 성공한 뒤에만 상태를 RELEASE로 전환하며, 재고 부족 시 `Sample::DecreaseStock`의 `std::invalid_argument`가 그대로 전파되고 상태는 CONFIRMED로 유지됨 — "모니터링 재고는 출고 전 값" 요구사항에 따라 출고 시 실제 창고 재고 차감을 반영). Red 테스트: `SampleOrderSystemTests/OrderTests.cpp` (2026-07-15 Phase 6 Red 확인 — `model/Order.h`가 아직 무인자 `Release()`라 C2660 컴파일 오류 9건) |
 | `ProductionLine`(FIFO 스케줄러) + 생산 실시간(wall-clock) 판정 로직 | produce | 실 생산량 `ceil(부족분/수율)` 경계값(나누어떨어짐/안 떨어짐), 총 생산 시간 계산, FIFO 순서 보장(먼저 들어온 주문 먼저 생산), **생산 큐 등록 API 분기**(동일 시료가 이미 생산 중이면 대기열에 추가만 되고, 아니면 즉시 생산 시작), 한 번에 하나의 시료만 생산되는지(다른 시료 주문이 동시에 등록돼도 즉시 시작), 생산 시작 직후 조회 시 미완료, 총 생산 시간 정확히 경과 시 완료(경계값, Order CONFIRMED 전환 + Sample 재고 반영 동시 검증), 총 생산 시간 절반만 경과 시 미완료 유지, 완료 시 FIFO 대기열의 다음 job이 즉시 시작되는지, **앱 재시작 후에도 실제 경과 시간 기준으로 완료 판정**(ExportState로 저장한 시작/예상 완료 시각을 새 인스턴스에 RestoreState로 복원한 뒤, 이미 경과 시각이 지났으면 즉시 완료 처리, 아직 안 지났으면 대기 상태 유지), ISO 8601 `FormatTimePoint`/`ParseTimePoint` 왕복 일치. Red 테스트: `SampleOrderSystemTests/ProductionLineTests.cpp` (2026-07-15 Red 확인 — `produce/ProductionLine.h`가 Phase 0 빈 스텁이라 `ProductionLine`/`ProductionJob`/`ComputeActualQuantity` 등 미선언으로 91개 컴파일 오류(C2653/C3861/C2065/C2146 등, `-t:SampleOrderSystemTests` 빌드 100개 초과로 조기 중단)).<br><br>**확정 API 설계** (`produce/ProductionLine.h`, produce_agent 구현 대상, 전역 네임스페이스 — `Sample`/`Order`와 동일한 관례):<br>`struct ProductionJob { std::string orderId; std::string sampleId; int shortage=0; int actualQuantity=0; int totalMinutes=0; std::chrono::system_clock::time_point startedAt; std::chrono::system_clock::time_point expectedEndAt; };`<br>`class ProductionLine { public: using NowProvider = std::function<std::chrono::system_clock::time_point()>; explicit ProductionLine(NowProvider nowProvider = []{ return std::chrono::system_clock::now(); }); void Enqueue(const std::string& orderId, const std::string& sampleId, int shortage, const Sample& sample); std::vector<std::string> ProcessCompletions(OrderRepository& orders, SampleRepository& samples); std::optional<ProductionJob> CurrentJob(const std::string& sampleId) const; std::vector<ProductionJob> PendingQueue(const std::string& sampleId) const; std::vector<data::ProductionState> ExportState() const; void RestoreState(const std::vector<data::ProductionState>& states, OrderRepository& orders); static std::string FormatTimePoint(std::chrono::system_clock::time_point tp); static std::chrono::system_clock::time_point ParseTimePoint(const std::string& iso8601); static int ComputeActualQuantity(int shortage, double yieldRate); };`<br><br>**설계 결정 및 이유**:<br>1. **shortage 전달 방식**: `Enqueue`는 shortage(부족분)를 호출자(controller_agent)로부터 인자로 전달받고, ProductionLine이 SampleRepository를 다시 조회해 "현재" 재고로 재계산하지 않는다. 이유: `Order::Approve(sample)`이 이미 승인 시점의 `sample.Stock()`과 `quantity_`를 비교해 PRODUCING 여부를 판정했으므로, 그 시점의 부족분(`quantity - stockAtApproval`)이 실제로 생산해야 할 양을 결정하는 근거다. Enqueue 시점에 재고를 다시 읽으면 그 사이 다른 주문의 생산 완료로 재고가 이미 증가해있을 수 있어(동일 시료에 대해 여러 주문이 큐에 쌓인 경우) 실제 필요량과 어긋날 위험이 있다. 따라서 승인 시점에 이미 확정된 shortage 값을 그대로 전달받는 방식으로 설계했다.<br>2. **시간 주입 방식**: 생성자가 `NowProvider`(`std::function<time_point()>`)를 받고 기본값은 `std::chrono::system_clock::now()`. 테스트에서는 가변 상태를 갖는 `FakeClock` 콜러블을 참조 캡처하는 람다(`[&clock]{ return clock(); }`)를 넘겨 시간을 임의로 전진시키며(`AdvanceMinutes`) wall-clock 판정을 검증한다. `ProcessCompletions`가 호출될 때마다 `nowProvider()`를 다시 호출하므로 같은 인스턴스에서 시간 경과를 시뮬레이션할 수 있다.<br>3. **RestoreState와 `data::ProductionState`의 관계**: `data::ProductionState`(이미 Green, 수정 불가)는 `orderId`/`productionStartAt`/`productionEndAt`/`actualQuantity`만 가지고 `sampleId`/`shortage` 필드가 없다. `ExportState`는 이 스키마 그대로 내보내고, `RestoreState(states, orders)`는 각 `orderId`를 `OrderRepository`에서 조회해 `sampleId`를 복원한다(주문 자체는 이미 orders.json에 영속화되어 있으므로 sampleId 조회가 항상 가능하다는 전제). `shortage`는 완료 판정/재고 반영에 불필요하므로(이미 계산된 `actualQuantity`만 있으면 충분) 복원 시 0으로 둔다.<br>4. **SampleRepository 의존성(모델 계층에 필요한 추가 오버로드)**: `ProcessCompletions`은 완료된 job에 대해 `orders.Find(orderId).CompleteProduction(sample, actualQuantity)`를 호출해야 하므로 **가변** `Sample&`이 필요하다. 그런데 현재 `model/Sample.h`의 `SampleRepository`는 `const Sample& Find(const std::string&) const` 오버로드만 제공한다(`OrderRepository`는 const/non-const 두 오버로드를 모두 제공하는 것과 비대칭). 이 문서 작성 시점 기준으로 `model/Sample.h`는 이미 Green이라 TDD_Agent가 직접 수정하지 않았지만, **produce_agent Green 전환 전에 model_agent가 `Sample& Find(const std::string&)` 비-const 오버로드를 추가해야 한다** (기존 const Find/기존 테스트를 깨지 않는 순수 추가이므로 회귀 위험 없음). orchestrator는 Phase 4 착수 시 이 선행 작업을 model_agent에게 먼저 배정해야 한다.<br>5. FIFO 대기열은 시료(sampleId)별로 독립적으로 관리하며, 완료된 job이 있으면 같은 시료의 대기열에서 다음 job을 지금 시각(`nowProvider()`)에 즉시 시작시킨다. |
 | `Repository` 직렬화/역직렬화 | data | 정상 JSON 왕복(round-trip) 일치(Sample/Order/생산 진행 상태 각각), 파일 손상/누락 시 fallback(빈 상태 시작), 필드 누락 시 처리, **`SaveOrder` 단일 주문 갱신 시 다른 주문 데이터가 훼손되지 않는지**, 생산 진행 상태(`productionStartAt`/`productionEndAt`) 왕복 후 ISO 8601 파싱 결과가 원본과 일치하는지. 확정 API(`data/Repository.h`, `namespace data`, data_agent 구현 대상, 2026-07-15 Red 확인 — `data/Repository.h`가 Phase 0 빈 스텁이라 `data` 네임스페이스/함수 미선언으로 C2653/C3861/C2923 등 72개 컴파일 오류): <br>`constexpr const char* kSamplesFilePath = "samples.json";` / `kOrdersFilePath = "orders.json";` / `kProductionStateFilePath = "production_state.json";` <br>`void SaveSamples(const std::vector<Sample>&, const std::string& filePath = kSamplesFilePath);` <br>`std::vector<Sample> LoadSamples(const std::string& filePath = kSamplesFilePath);` — 파일 없음/JSON 파싱 실패 시 예외를 던지지 않고 빈 vector 반환 <br>`void SaveOrders(const std::vector<Order>&, const std::string& filePath = kOrdersFilePath);` <br>`std::vector<Order> LoadOrders(const std::string& filePath = kOrdersFilePath);` — 파일 없음/손상 시 빈 vector 반환 <br>`void SaveOrder(const Order&, const std::string& filePath = kOrdersFilePath);` — filePath의 기존 주문 목록을 로드 후 동일 `Id()`가 있으면 해당 주문만 교체(update), 없으면 추가(insert)한 뒤 재저장. 다른 주문 필드는 훼손하지 않음 <br>`struct ProductionState { std::string orderId; std::string productionStartAt; std::string productionEndAt; int actualQuantity = 0; };` <br>`void SaveProductionState(const std::vector<ProductionState>&, const std::string& filePath = kProductionStateFilePath);` <br>`std::vector<ProductionState> LoadProductionState(const std::string& filePath = kProductionStateFilePath);` — 파일 없음/손상 시 빈 vector 반환. <br>Order는 `orderId_`/`customerName_`/`sampleId_`/`quantity_`/`status_` 필드를 그대로 저장하며(`docs_temp/data/phase.md`의 `sampleName`은 예시일 뿐이고 실제 model_agent 구현인 `sampleId`/`customerName`을 우선), `OrderStatus`는 JSON에서 문자열("RESERVED"/"REJECTED"/"PRODUCING"/"CONFIRMED"/"RELEASE")로 직렬화한다. JSON 파싱/직렬화 내부 구현 방식(직접 만든 경량 파서 vs nlohmann/json 등 vendor 헤더온리 라이브러리)은 data_agent가 선택하되, 위 공개 API 시그니처만 준수하면 된다 — TDD_Agent 제안: 이 프로젝트 규모(단순 구조체 목록, 중첩 없는 평면적 스키마)에서는 직접 만든 경량 JSON 파서/라이터로 충분하나, 향후 스키마가 복잡해질 가능성을 고려하면 nlohmann/json(헤더 온리) vendor 추가도 안전한 대안이다. Red 테스트: `SampleOrderSystemTests/RepositoryTests.cpp` |
-| 재고 상태 판정(여유/부족/고갈) 및 모니터링 집계 (`MonitoringService`) | model | 재고=0→고갈(수요와 무관), 0<재고<수요→부족, 재고>=수요 경계값→여유(재고==수요 포함), 수요=0이고 재고>0→여유, 특정 시료의 미출고 주문 수요 합계(REJECTED/RELEASE 제외한 RESERVED+PRODUCING+CONFIRMED 수량 합산, 다른 시료 주문은 제외, 해당 없으면 0), 상태별 주문 수 집계 시 REJECTED 제외 및 RESERVED/CONFIRMED/PRODUCING/RELEASE 정확히 카운트(빈 목록이면 전부 0). Red 테스트: `SampleOrderSystemTests/MonitoringTests.cpp` (Phase 2 완료, 2026-07-15 Red 확인 — `model/MonitoringService.h` 부재로 C1083 컴파일 실패). 확정 시그니처(model_agent 구현 대상, `model/MonitoringService.h`): `enum class StockStatus { SURPLUS, SHORTAGE, DEPLETED }`; `StockStatus JudgeStockStatus(int stock, int demand)`(순수 함수, stock==0이면 항상 DEPLETED, 0<stock<demand면 SHORTAGE, stock>=demand면 SURPLUS — demand==0 포함); `int SumUndeliveredDemand(const std::vector<Order>& orders, const std::string& sampleId)`(RESERVED/PRODUCING/CONFIRMED 상태이면서 sampleId 일치하는 주문의 Quantity() 합산, REJECTED/RELEASE 및 다른 sampleId 제외); `struct OrderStatusCounts { int reserved=0; int confirmed=0; int producing=0; int release=0; }`; `OrderStatusCounts CountOrdersByStatus(const std::vector<Order>& orders)`(REJECTED 제외 나머지 4개 상태 카운트). task 예시 대비 조정: JudgeStockStatus는 (stock, demand) 두 정수만 받는 순수 분류 함수로 유지하고, "미출고 수요 합계 계산"은 별도 헬퍼(`SumUndeliveredDemand`)로 분리 — JudgeStockStatus 자체의 경계값 테스트를 Order/vector 구성과 무관하게 독립적으로 검증하기 위함. |
+| 재고 상태 판정(여유/부족/고갈) 및 모니터링 집계 (`MonitoringService`) | model | 재고=0→고갈(수요와 무관), 0<재고<수요→부족, 재고>=수요 경계값→여유(재고==수요 포함), 수요=0이고 재고>0→여유, 특정 시료의 미출고 주문 수요 합계(REJECTED/RELEASE 제외한 RESERVED+PRODUCING+CONFIRMED 수량 합산, 다른 시료 주문은 제외, 해당 없으면 0), 상태별 주문 수 집계 시 REJECTED 제외 및 RESERVED/CONFIRMED/PRODUCING/RELEASE 정확히 카운트(빈 목록이면 전부 0). Red 테스트: `SampleOrderSystemTests/MonitoringTests.cpp` (Phase 2 완료, 2026-07-15 Red 확인 — `model/MonitoringService.h` 부재로 C1083 컴파일 실패). 확정 시그니처(model_agent 구현 대상, `model/MonitoringService.h`): `enum class StockStatus { SURPLUS, SHORTAGE, DEPLETED }`; `StockStatus JudgeStockStatus(int stock, int demand)`(순수 함수, stock==0이면 항상 DEPLETED, 0<stock<demand면 SHORTAGE, stock>=demand면 SURPLUS — demand==0 포함); `int SumUndeliveredDemand(const std::vector<Order>& orders, const std::string& sampleId)`(**2026-07-15 변경, Phase 6**: PRODUCING/CONFIRMED 상태이면서 sampleId 일치하는 주문의 Quantity() 합산 — RESERVED는 아직 승인되지 않아 확정된 수요가 아니므로 REJECTED/RELEASE와 함께 제외. Red 테스트: `SampleOrderSystemTests/MonitoringTests.cpp`, 2026-07-15 Phase 6 Red 확인 대상); `struct OrderStatusCounts { int reserved=0; int confirmed=0; int producing=0; int release=0; }`; `OrderStatusCounts CountOrdersByStatus(const std::vector<Order>& orders)`(REJECTED 제외 나머지 4개 상태 카운트). task 예시 대비 조정: JudgeStockStatus는 (stock, demand) 두 정수만 받는 순수 분류 함수로 유지하고, "미출고 수요 합계 계산"은 별도 헬퍼(`SumUndeliveredDemand`)로 분리 — JudgeStockStatus 자체의 경계값 테스트를 Order/vector 구성과 무관하게 독립적으로 검증하기 위함. |
 
 ### TDD 낮음/불필요
 
@@ -234,3 +234,79 @@
 - Red 확인: `msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행 결과 91개 컴파일 오류 발생(1000개 초과분은 MSBuild가 100개에서 조기 중단) — `ProductionLine`/`ProductionJob`/`ComputeActualQuantity` 등이 `produce/ProductionLine.h`(Phase 0 빈 스텁)에 선언되어 있지 않아 예상대로 Red.
 - **produce_agent Green 전환 전 필수 선행 작업**: `model/Sample.h`의 `SampleRepository`에 비-const `Sample& Find(const std::string&)` 오버로드 추가가 필요하다(현재는 const 오버로드만 존재해 `ProcessCompletions`가 재고를 증가시킬 가변 참조를 얻을 수 없음). `OrderRepository`가 이미 const/non-const 두 오버로드를 제공하는 것과 대칭을 맞추는 순수 추가이므로 기존 테스트에 영향 없음. orchestrator는 이 작업을 model_agent에게 먼저 배정한 뒤 produce_agent의 `ProductionLine.h` 구현을 진행시켜야 한다.
 - 다음 단계: (1) model_agent가 `SampleRepository::Find` 비-const 오버로드 추가, (2) produce_agent가 위 확정 API대로 `produce/ProductionLine.h`(+ 필요 시 `.cpp`)를 구현해 Green 전환.
+
+## Phase 6 진행 상황 (2026-07-15) — 사용자 요구사항 2건 추가(Red)
+
+사용자가 다음 2가지 요구사항을 추가했다:
+1. 모니터링/재고 확인 시 보여지는 재고(quantity)는 "출고(Release) 전" 값이므로, 실제 출고 처리 시
+   Sample 재고가 주문 수량만큼 차감되어야 한다(현재 `Order::Release()`는 상태만 바꾸고 재고를 건드리지
+   않음 — 버그성 누락).
+2. 모니터링 재고 상태(여유/부족/고갈) 판정에 쓰이는 "수요"는 CONFIRMED/PRODUCING만 고려해야 하며,
+   아직 승인되지 않은 RESERVED 주문은 확정된 수요가 아니므로 제외해야 한다(현재
+   `SumUndeliveredDemand`는 RESERVED/PRODUCING/CONFIRMED를 모두 합산).
+
+### 요구사항 1 — Order::Release가 Sample 재고를 차감하도록 시그니처 변경 (Red)
+
+- `model/Order.h`: 기존 `void Release()`(무인자, 상태만 CONFIRMED→RELEASE 전환)를
+  `void Release(Sample& sample)`로 변경해야 한다. `CompleteProduction(Sample&, int)`과 동일한 순서
+  원칙을 따른다 — **재고 차감(`sample.DecreaseStock(quantity_)`)을 먼저 시도해 성공한 뒤에만 상태를
+  RELEASE로 전환**한다. 재고가 부족하면 `Sample::DecreaseStock`이 `std::invalid_argument`를 던지고,
+  이 예외가 그대로 전파되며 주문 상태는 CONFIRMED로 유지되어야 한다(상태를 먼저 바꾸고 재고 차감을
+  시도하면, 재고 부족 시 "출고는 실패했는데 상태만 RELEASE로 바뀌는" 불일치가 생기므로 반드시 차감을
+  먼저 시도하는 순서로 구현해야 한다). CONFIRMED가 아닌 상태(RESERVED/PRODUCING/REJECTED/RELEASE)에서
+  호출 시 `std::logic_error`를 던지고 재고는 변하지 않아야 한다(상태 검사가 재고 차감보다 먼저 이루어짐).
+  model_agent 담당.
+- `controller/MenuController.h`: `HandleRelease()`(363번째 줄 근처)의 `order.Release();` 호출을
+  `order.Release(sample);`로 변경해야 한다(해당 주문의 `SampleId()`로 `samples_.Find(...)`한 가변
+  `Sample&`을 전달). 이번 작업 범위 아님 — controller_agent가 Green 전환 시 함께 수정.
+- **Red 테스트 추가/수정** (`SampleOrderSystemTests/OrderTests.cpp`):
+  - 인터페이스 주석의 `Release()` 시그니처를 `Release(Sample&)`로 갱신하고 재고 차감/차감 순서 계약을
+    명시.
+  - "CONFIRMED 주문을 출고 처리하면 RELEASE로 전이하고 Sample 재고를 주문 수량만큼 차감한다": 재고 20,
+    주문 수량 10인 CONFIRMED 주문을 `Release(sample)` 호출 후 상태 RELEASE, `sample.Stock() == 10` 확인.
+  - "출고 처리 시 재고가 주문 수량보다 부족하면 예외가 전파되고 주문 상태는 CONFIRMED로 유지된다": 승인
+    이후 외부 요인으로 재고가 줄어(20→5) 주문 수량(10)보다 부족해진 상황에서 `Release(sample)` 호출 시
+    `std::invalid_argument`가 전파되고, 주문 상태는 CONFIRMED 유지, `sample.Stock()`은 차감 없이 5 유지.
+  - "허용되지 않는 상태 전이는 거부된다" 섹션의 출고 관련 SECTION들을 `Release(sample)` 형태로 갱신하고,
+    각각 재고가 변하지 않는지(`REQUIRE(sample.Stock() == ...)`)와 상태가 유지되는지 함께 확인하도록
+    보강. PRODUCING/REJECTED 상태에서의 거부 SECTION을 신규 추가(기존에는 RESERVED/RELEASE 상태에서의
+    거부만 있었음).
+  - 기존에 무인자로 호출하던 모든 `.Release()` 호출부(`OrderTests.cpp`, `MonitoringTests.cpp`)를
+    `.Release(sample)`로 갱신.
+
+### 요구사항 2 — SumUndeliveredDemand에서 RESERVED 제외 (Red)
+
+- `model/MonitoringService.h`: `SumUndeliveredDemand`의 `switch` 문에서 `case OrderStatus::RESERVED:`
+  분기를 제거해, PRODUCING/CONFIRMED 상태의 주문 수량만 합산하도록 변경해야 한다. model_agent 담당.
+- **Red 테스트 추가/수정** (`SampleOrderSystemTests/MonitoringTests.cpp`):
+  - 인터페이스 주석 갱신: "PRODUCING/CONFIRMED 상태의 주문 수량만 합산하며 RESERVED는 확정된 수요가
+    아니므로 제외한다"는 계약 명시.
+  - 기존 "SumUndeliveredDemand: 특정 시료에 대한 미출고 주문 수량만 합산한다" 테스트를 "RESERVED/
+    PRODUCING/CONFIRMED만 합산"에서 "CONFIRMED/PRODUCING만 합산하고 RESERVED는 제외"로 기대값을
+    수정(RESERVED 3 + CONFIRMED 4 + PRODUCING 7 = 14 → CONFIRMED 4 + PRODUCING 7 = 11, RESERVED
+    수량 3은 더 이상 포함되지 않음을 주석으로 명시).
+  - 신규 테스트 "SumUndeliveredDemand: RESERVED 상태 주문만 있으면 수요는 0이다" 추가(RESERVED만 있는
+    주문 목록에 대해 결과가 0인지 확인하는 경계 케이스).
+  - 이 파일 내 `.Release()` 호출(2건, CountOrdersByStatus/기존 SumUndeliveredDemand 테스트의 RELEASE
+    시나리오 준비용)도 `.Release(sample)`로 갱신.
+
+### Red 확인 결과 (2026-07-15)
+
+`msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행
+결과, `MonitoringTests.cpp`/`OrderTests.cpp` 컴파일 단계에서 **9개의 C2660 컴파일 오류**가 발생했다(모두
+"`Order::Release`: 함수는 1개의 인수를 사용하지 않습니다" — `model/Order.h`의 `Release()`가 아직 무인자
+시그니처이기 때문). 오류 발생 위치: `MonitoringTests.cpp:115, 170`, `OrderTests.cpp:171, 182, 194, 205,
+208, 238, 255`. 예상대로 Red — `SumUndeliveredDemand`의 RESERVED 제외 로직은 `model/MonitoringService.h`가
+아직 변경되지 않았으므로 컴파일 자체는 통과하나(값 비교 실패로 런타임 Red가 될 예정), 이번 빌드는
+Release 시그니처 불일치로 컴파일 단계에서 조기 실패해 `SumUndeliveredDemand` 관련 테스트의 런타임 실행
+결과는 이번 실행에서 확인되지 않았다. model_agent가 `Order::Release(Sample&)`와 `SumUndeliveredDemand`의
+RESERVED 제외 로직을 함께 Green 전환한 뒤 재빌드하면 모든 신규/수정 테스트가 통과해야 한다.
+
+### 다음 단계(Green 전환 담당)
+
+1. model_agent: `model/Order.h`의 `Release()`를 `Release(Sample& sample)`로 변경(재고 차감 우선, 실패
+   시 상태 유지), `model/MonitoringService.h`의 `SumUndeliveredDemand`에서 RESERVED 케이스 제거.
+2. controller_agent: `controller/MenuController.h`의 `HandleRelease()`에서 `order.Release();`를
+   `order.Release(sample);`로 변경(해당 주문의 시료를 `samples_.Find(order.SampleId())`로 조회해 전달).
+3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트가 Green이 되는지
+   확인(신규/수정된 Release 및 SumUndeliveredDemand 관련 테스트 케이스 전부 통과 확인 필요).

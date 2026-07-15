@@ -11,9 +11,12 @@
 //   //  - 여유(SURPLUS):  stock >= demand (demand == 0인 경우도 포함 — 수요가 없으면 항상 여유로 처리)
 //   StockStatus JudgeStockStatus(int stock, int demand);
 //
-//   // 미출고 주문 수요 합계: 특정 sampleId에 대해 REJECTED/RELEASE를 제외한 상태(RESERVED/PRODUCING/
-//   // CONFIRMED)의 주문 수량(Quantity())을 모두 합산한다.
-//   // (RELEASE는 이미 출고되어 더 이상 재고 수요가 아니므로 제외, REJECTED는 애초에 유효한 주문이 아니므로 제외)
+//   // 미출고 주문 수요 합계: 특정 sampleId에 대해 확정된 수요만 합산한다. 2026-07-15 변경(Red):
+//   // 사용자가 "모니터링 재고 상태 판정에 쓰이는 수요는 CONFIRMED/PRODUCING만 고려해야 하며, 아직
+//   // 승인되지 않은 RESERVED는 확정된 수요가 아니므로 제외해야 한다"는 요구사항을 추가함에 따라
+//   // PRODUCING/CONFIRMED 상태의 주문 수량(Quantity())만 합산하도록 변경한다.
+//   // (RELEASE는 이미 출고되어 더 이상 재고 수요가 아니므로 제외, REJECTED는 애초에 유효한 주문이 아니므로
+//   //  제외, RESERVED는 아직 승인되지 않아 확정된 수요가 아니므로 제외)
 //   int SumUndeliveredDemand(const std::vector<Order>& orders, const std::string& sampleId);
 //
 //   // 상태별 주문 수 집계: REJECTED는 집계에서 제외한다.
@@ -77,7 +80,7 @@ TEST_CASE("JudgeStockStatus: 재고 >= 수요이면 여유(SURPLUS)이다(경계
     }
 }
 
-TEST_CASE("SumUndeliveredDemand: 특정 시료에 대한 미출고 주문 수량만 합산한다", "[Monitoring][demand]")
+TEST_CASE("SumUndeliveredDemand: 특정 시료에 대해 CONFIRMED/PRODUCING 주문 수량만 합산하고 RESERVED는 제외한다", "[Monitoring][demand]")
 {
     Sample sample("S-001", "TestSample", 10, 0.9);
     sample.IncreaseStock(100);
@@ -87,16 +90,15 @@ TEST_CASE("SumUndeliveredDemand: 특정 시료에 대한 미출고 주문 수량
 
     std::vector<Order> orders;
 
-    // S-001에 대한 RESERVED 주문 (수요에 포함되어야 함)
+    // S-001에 대한 RESERVED 주문 (2026-07-15 변경: 아직 승인되지 않아 확정된 수요가 아니므로 수요에서 제외되어야 함)
     orders.emplace_back("O-001", "Alice", "S-001", 3);
 
-    // S-001에 대한 PRODUCING 주문 (수요에 포함되어야 함)
-    Order producingOrder("O-002", "Bob", "S-001", 4);
-    producingOrder.Approve(sample); // 재고 100 >= 4 이므로 실제로는 CONFIRMED가 되지만,
-                                     // 아래 별도 케이스에서 재고 0 상태로 PRODUCING을 유도한다.
-    orders.push_back(producingOrder);
+    // S-001에 대한 CONFIRMED 주문 (수요에 포함되어야 함)
+    Order confirmedOrder("O-002", "Bob", "S-001", 4);
+    confirmedOrder.Approve(sample); // 재고 100 >= 4 이므로 CONFIRMED
+    orders.push_back(confirmedOrder);
 
-    // 재고 부족 상황을 만들어 PRODUCING 상태의 주문을 별도로 준비
+    // 재고 부족 상황을 만들어 PRODUCING 상태의 주문을 별도로 준비 (수요에 포함되어야 함)
     Sample emptySample("S-003", "EmptySample", 10, 0.9);
     Order producingViaShortage("O-003", "Carol", "S-001", 7);
     producingViaShortage.Approve(emptySample); // emptySample.Stock() == 0 < 7 -> PRODUCING
@@ -110,15 +112,25 @@ TEST_CASE("SumUndeliveredDemand: 특정 시료에 대한 미출고 주문 수량
     // S-001에 대한 RELEASE 주문 (수요에서 제외되어야 함)
     Order releasedOrder("O-005", "Eve", "S-001", 50);
     releasedOrder.Approve(sample); // 재고 충분 -> CONFIRMED
-    releasedOrder.Release();
+    releasedOrder.Release(sample);
     orders.push_back(releasedOrder);
 
     // 다른 시료(S-002)에 대한 주문 (S-001 수요 합산에서 제외되어야 함)
     Order otherSampleOrder("O-006", "Frank", "S-002", 999);
     orders.push_back(otherSampleOrder);
 
-    // S-001 미출고 수요 = O-001(3, RESERVED) + O-002(4, CONFIRMED) + O-003(7, PRODUCING) = 14
-    REQUIRE(SumUndeliveredDemand(orders, "S-001") == 14);
+    // S-001 미출고 수요(RESERVED 제외) = O-002(4, CONFIRMED) + O-003(7, PRODUCING) = 11
+    // (O-001의 RESERVED 수량 3은 더 이상 포함되지 않는다)
+    REQUIRE(SumUndeliveredDemand(orders, "S-001") == 11);
+}
+
+TEST_CASE("SumUndeliveredDemand: RESERVED 상태 주문만 있으면 수요는 0이다", "[Monitoring][demand][reserved-excluded]")
+{
+    std::vector<Order> orders;
+    orders.emplace_back("O-020", "Alice", "S-001", 5);
+    orders.emplace_back("O-021", "Bob", "S-001", 8);
+
+    REQUIRE(SumUndeliveredDemand(orders, "S-001") == 0);
 }
 
 TEST_CASE("SumUndeliveredDemand: 해당 시료에 대한 주문이 없으면 0을 반환한다", "[Monitoring][demand][edge]")
@@ -155,7 +167,7 @@ TEST_CASE("CountOrdersByStatus: REJECTED를 제외하고 상태별 주문 수를
     // RELEASE 1건
     Order releasedOrder("O-005", "Eve", "S-001", 1);
     releasedOrder.Approve(sample);
-    releasedOrder.Release();
+    releasedOrder.Release(sample);
     orders.push_back(releasedOrder);
 
     // REJECTED 2건 (집계에서 제외되어야 함)

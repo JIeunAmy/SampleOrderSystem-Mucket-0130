@@ -16,7 +16,7 @@ description: 반도체 시료 생산주문관리 시스템에서 시료(Sample) 
 | 이름 | 시료명 |
 | 평균 생산시간 | 1개 생산에 걸리는 평균 시간 (분 단위, 소수점 허용) |
 | 수율 | 정상 생산 시료 수 / 총 생산 시료 수 (0~1 사이 값) |
-| 재고 수량 | 현재 보유 중인 시료 수량 (등록 시 기본값 0, 초기 재고 값을 지정하면 해당 값으로 시작 — 아래 "초기 재고 지정" 참고. 생산 완료 시 증가, 출고 시 감소). 생산 완료 시 증가하는 수량은 실 생산량(생산된 양, `ceil(부족분/수율)`)과 정확히 동일하며, 부족분(shortage) 자체가 아니다. |
+| 재고 수량 | 현재 보유 중인 시료 수량 (등록 시 기본값 0, 초기 재고 값을 지정하면 해당 값으로 시작 — 아래 "초기 재고 지정" 참고. 생산 완료 시 증가, 출고 시 감소). 생산 완료 시 증가하는 수량은 실 생산량(생산된 양, `ceil(부족분/수율)`)과 정확히 동일하며, 부족분(shortage) 자체가 아니다. **모니터링/재고 확인 화면에 표시되는 재고 수량은 항상 "출고(Release) 처리 전" 값이다** — CONFIRMED 상태의 주문이 실제로 출고 처리되어야 그 시점에 주문 수량만큼 재고가 차감되며, 출고 전에는 해당 수량이 계속 재고에 포함된 채로 표시된다. 아래 "출고(Release) 시 재고 차감" 참고. |
 
 등록된 시료만 주문 가능하므로, Order를 생성하기 전에 시료 ID가 존재하는지 반드시 검증한다.
 
@@ -42,6 +42,35 @@ Sample(std::string id, std::string name, double avgProductionTime, double yieldR
 재고 증가량은 항상 부족분(shortage)이 아니라 실 생산량과 정확히 동일해야 한다. 수율이 1 미만이면
 실 생산량이 부족분보다 커질 수 있으므로 이 둘을 혼동하지 않도록 주의한다.
 
+### 출고(Release) 시 재고 차감
+
+출고 처리는 `Order::Release(Sample& sample)` API로 이루어진다.
+
+```cpp
+void Release(Sample& sample); // CONFIRMED 상태에서만 호출 가능
+```
+
+- 주문 상태가 CONFIRMED가 아니면 즉시 `std::logic_error`를 던진다.
+- CONFIRMED 상태이면 먼저 `sample.DecreaseStock(quantity_)`로 재고 차감을 시도하고, **차감이 성공한 경우에만**
+  주문 상태를 RELEASE로 전환한다.
+- 재고가 부족해 `sample.DecreaseStock`이 `std::invalid_argument`를 던지면 그 예외가 그대로 호출자에게 전파되고,
+  이 경우 주문 상태는 CONFIRMED로 유지된다(RELEASE로 전환되지 않음). 즉 "재고 차감 성공 → 상태 전환"의 순서가
+  보장되어, 재고 차감 없이 출고 완료 상태가 되는 일은 없다.
+- Controller(`HandleRelease`)는 `Order::Release` 호출이 성공(재고 차감 성공)했을 때, 주문 상태 변경 저장
+  (`data::SaveOrder`)뿐 아니라 **변경된 Sample 재고도 반드시 함께 영속화**(`SaveAllSamples()`)해야 한다. 둘 중
+  하나만 저장하면 재실행 시 재고와 주문 상태가 불일치하게 되므로 항상 세트로 저장한다.
+
+### 모니터링 재고 판정 시 수요 계산 범위
+
+`MonitoringService::SumUndeliveredDemand`는 재고 상태(충분/부족/고갈)를 판정할 때 사용하는 "수요"를 계산하는
+API로, **CONFIRMED(출고 대기 중)와 PRODUCING(생산 중) 상태 주문의 수량만 합산**하고 RESERVED 상태 주문은
+합산에서 제외한다.
+
+- RESERVED는 아직 승인되지 않은 주문이므로 확정된 수요가 아니다. 승인권자가 거절(REJECTED)할 수도 있으므로,
+  재고 소진/부족 판정에 RESERVED 수량을 포함시키면 실제로는 발생하지 않을 수요까지 과대 계상하게 된다.
+- 승인이 완료되어 재고에서 확정적으로 차감될 예정인 CONFIRMED와, 이미 생산이 진행 중인 PRODUCING만 "미출고
+  확정 수요"로 간주한다.
+
 ### 영속화(Repository) 사이클에서의 재고 정확성
 
 `ProductionLine::ProcessCompletions`(wall-clock 기준 완료 판정)로 재고가 증가한 뒤에도, `data::SaveSamples`/
@@ -60,10 +89,14 @@ Sample(std::string id, std::string name, double avgProductionTime, double yieldR
 
 - **Model** (`model_agent`가 담당): Sample 클래스/구조체 정의, 시료 저장소(등록/조회/검색 API), 재고 증감 메서드.
   수율은 0~1 범위를 벗어나지 않도록 Model 내부에서 검증한다. `Order::CompleteProduction`은 실 생산량만큼만
-  재고를 증가시킨다.
+  재고를 증가시킨다. `Order::Release(Sample&)`는 CONFIRMED 상태에서만 재고 차감 성공 시 RELEASE로 전환하는
+  책임을 지며, `MonitoringService::SumUndeliveredDemand`는 CONFIRMED/PRODUCING 주문만 수요로 합산하고
+  RESERVED는 제외하는 책임을 진다.
 - **View** (`view_agent`가 담당): 시료 등록 입력 프롬프트, 시료 목록/검색 결과를 표 형태로 출력.
 - **Controller** (`controller_agent`가 담당): 시료 관리 하위 메뉴(등록/목록/검색) 분기, View에서 받은 입력을
   Model의 등록·조회·검색 API로 연결. 시료 주문 생성 시 `samples_.Contains(sampleId)`로 미등록 시료를 걸러낸다.
+  `HandleRelease`는 `Order::Release` 성공 시 주문 상태 저장(`SaveOrder`)과 함께 반드시 재고 영속화
+  (`SaveAllSamples()`)까지 챙겨야 한다.
 - **Produce** (`produce_agent`가 담당): FIFO 큐 스케줄링, 실 생산량/총 생산 시간 계산, wall-clock 기준 완료
   판정과 함께 실 생산량만큼 Sample 재고를 반영(부족분이 아님)한다.
 - **Data** (`data_agent`가 담당): 시료/주문/생산 상태를 JSON으로 영속화하며, 생산 완료로 증가한 재고 수량이
@@ -84,3 +117,8 @@ Sample(std::string id, std::string name, double avgProductionTime, double yieldR
 5. 생산 완료 시 Sample 재고에 더해지는 값이 부족분이 아니라 실 생산량(`producedQuantity`)과 정확히 같은지 확인한다.
 6. 생산 완료로 늘어난 재고가 Repository 저장/재로드 사이클을 거쳐도 그대로 유지되는지(통합 테스트 포함) 확인한다.
 7. 미등록 시료 ID로는 주문 생성 및 생산 큐 진입이 모두 불가능한지(Controller 검증 + `ProductionLine::Enqueue`의 Sample 객체 요구 구조) 확인한다.
+8. 모니터링/재고 확인에 표시되는 재고 수량이 "출고 전" 값인지, `Order::Release(Sample&)`가 CONFIRMED 상태에서
+   재고 차감(`DecreaseStock`) 성공 시에만 RELEASE로 전환하고(재고 부족 시 예외 전파 + CONFIRMED 유지) Controller의
+   `HandleRelease`가 `SaveOrder`와 `SaveAllSamples()`를 함께 호출하는지 확인한다.
+9. `MonitoringService::SumUndeliveredDemand`가 RESERVED를 제외하고 CONFIRMED/PRODUCING 주문 수량만 합산해
+   재고 상태(충분/부족/고갈)를 판정하는지 확인한다.

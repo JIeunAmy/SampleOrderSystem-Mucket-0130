@@ -305,7 +305,7 @@ namespace data
             {
                 Sample sufficientStock("__reconstruct__", "__reconstruct__", 1, 1.0, quantity);
                 order.Approve(sufficientStock); // -> CONFIRMED
-                order.Release();                // -> RELEASE
+                order.Release(sufficientStock); // -> RELEASE
                 break;
             }
             }

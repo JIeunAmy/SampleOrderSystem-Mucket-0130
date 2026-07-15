@@ -359,8 +359,19 @@ private:
             return;
         }
 
-        order.Release();
+        try
+        {
+            Sample& sample = samples_.Find(order.SampleId());
+            order.Release(sample);
+        }
+        catch (const std::exception& e)
+        {
+            view_.ShowMessage(std::string("[오류] 출고 처리 실패: ") + e.what());
+            return;
+        }
+
         data::SaveOrder(order);
+        SaveAllSamples();
         view_.ShowReleaseResult(order);
     }
 

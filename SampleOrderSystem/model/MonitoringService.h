@@ -35,8 +35,9 @@ inline StockStatus JudgeStockStatus(int stock, int demand)
     return StockStatus::SURPLUS;
 }
 
-// 미출고 주문 수요 합계: 특정 sampleId에 대해 RESERVED/PRODUCING/CONFIRMED 상태 주문의
-// 수량(Quantity())을 모두 합산한다. (REJECTED/RELEASE 및 다른 sampleId는 제외)
+// 미출고 주문 수요 합계: 특정 sampleId에 대해 PRODUCING/CONFIRMED 상태 주문의
+// 수량(Quantity())을 모두 합산한다. (RESERVED/REJECTED/RELEASE 및 다른 sampleId는 제외)
+// RESERVED는 아직 승인되지 않아 확정된 수요가 아니므로 제외한다.
 inline int SumUndeliveredDemand(const std::vector<Order>& orders, const std::string& sampleId)
 {
     int total = 0;
@@ -50,7 +51,6 @@ inline int SumUndeliveredDemand(const std::vector<Order>& orders, const std::str
 
         switch (order.Status())
         {
-        case OrderStatus::RESERVED:
         case OrderStatus::PRODUCING:
         case OrderStatus::CONFIRMED:
             total += order.Quantity();

@@ -72,13 +72,14 @@ public:
         status_ = OrderStatus::CONFIRMED;
     }
 
-    void Release()
+    void Release(Sample& sample)
     {
         if (status_ != OrderStatus::CONFIRMED)
         {
             throw std::logic_error("Order can only be released from CONFIRMED status");
         }
 
+        sample.DecreaseStock(quantity_);
         status_ = OrderStatus::RELEASE;
     }
 
