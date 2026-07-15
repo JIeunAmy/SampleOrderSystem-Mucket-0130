@@ -1,7 +1,8 @@
 # orchestrator 작업 Phase
 
-세부 에이전트별 phase 문서(`docs_temp/{model,data,produce,controller,view,tdd}/phase.md`)를 참고해
-아래와 같이 전체 순서를 재구성한다. 각 Phase는 이전 Phase가 노출하는 API가 확정되어야 시작할 수 있다.
+세부 에이전트별 phase 문서(`docs_temp/{model,data,produce,controller,view,tdd}/phase.md`)와
+`docs/[CRA_AI] Day3_개인과제_반도체시료관리.pdf`(10~24페이지, 기능 명세 원본)를 대조해 전체 순서를 재구성한다.
+각 Phase는 이전 Phase가 노출하는 API가 확정되어야 시작할 수 있다.
 
 ## Phase 0 — 프로젝트 골격
 - `SampleOrderSystem.vcxproj`에 `model/`, `data/`, `produce/`, `controller/`, `view/` 디렉터리 구조 확정
@@ -20,7 +21,9 @@
 ## Phase 2 — Model 구현 (`model_agent`, Phase 0 확정 후 시작)
 - 상세 내용은 `docs_temp/model/phase.md` 참고
 - `Sample`(수율 검증, 재고), `Order`(상태 전이), 생산 완료 반영 API, 인메모리 저장소 API 구현
-- **Red-Green 루프 적용 대상**: `Sample`, `Order` — `docs_temp/tdd/phase.md` 표 기준으로 Phase 2-A(아래) 진행
+- **모니터링 집계 API 포함** (PDF 20페이지: 상태별 주문 수 집계 REJECTED 제외 + 시료별 재고 여유/부족/고갈 판정) —
+  이 판정 로직은 model_agent가 소유하고 controller_agent는 호출만 한다
+- **Red-Green 루프 적용 대상**: `Sample`, `Order`, 재고 상태 판정(여유/부족/고갈) — `docs_temp/tdd/phase.md` 표 기준으로 진행
 
 ## Phase 3 — Data 영속성 (`data_agent`, Phase 2의 구조체 정의 확정 후 시작)
 - 상세 내용은 `docs_temp/data/phase.md` 참고
@@ -29,12 +32,17 @@
 
 ## Phase 4 — Produce 생산 라인 (`produce_agent`, Phase 2의 생산 완료 반영 API + Phase 3의 저장소 API 확정 후 시작)
 - 상세 내용은 `docs_temp/produce/phase.md` 참고
+- **생산 큐 등록 API 포함** (PDF 16페이지: 승인 시 재고 부족이면 "생산 라인에 자동으로 등록") —
+  controller_agent가 승인 처리 중 호출할 "주문을 FIFO 큐에 등록" API를 이 Phase에서 함께 노출한다
 - FIFO 대기열, 실 생산량/총 생산 시간 계산, wall-clock 기반 실시간 완료 판정 및 앱 재시작 복구 로직 구현
 - **Red-Green 루프 적용 대상**: `ProductionLine`(FIFO 스케줄러), 생산 실시간(wall-clock) 판정 로직
 
 ## Phase 5 — Controller 메뉴 분기 (`controller_agent`, Phase 2~4 API 확정 후 시작)
 - 상세 내용은 `docs_temp/controller/phase.md` 참고
 - 6개 메인 메뉴 분기, Model/Produce API 호출, data_agent 저장 호출 지점 삽입
+- **연결 지점 주의**: 승인 처리 시 Model 판정이 `PRODUCING`이면 반드시 Phase 4의 produce_agent 생산 큐 등록 API를
+  이어서 호출한다. 이 호출이 빠지면 승인은 되었지만 생산이 시작되지 않는 버그가 되므로, 인터페이스 검증(Phase 7)에서
+  반드시 확인한다.
 - TDD 우선순위 낮음(단순 분기) — 통합 테스트/수동 확인으로 대체, Red-Green 루프 미적용
 
 ## Phase 6 — View 콘솔 입출력 (`view_agent`, Controller가 넘길 데이터 형태 확정 후 시작, Phase 5와 병행 가능)
@@ -63,3 +71,7 @@
 4. 계층 간 인터페이스 시그니처 불일치 점검 (Model API ↔ Controller 호출, Controller ↔ View 데이터 형태, produce_agent ↔ Model/Data API)
 5. 상태 전이 규칙 및 계산식(실 생산량 `ceil(부족분/수율)`, 총 생산 시간 `평균생산시간 * 실생산량`)이 CLAUDE.md 명세와 일치하는지 최종 확인
 6. Phase 1에서 식별된 TDD 대상 클래스가 모두 Green 상태인지 최종 확인
+7. **PDF 원본 대조** (`docs/[CRA_AI] Day3_개인과제_반도체시료관리.pdf` 10~24페이지)
+   - 승인 시 `PRODUCING` 판정된 주문이 실제로 produce_agent의 생산 큐에 등록되는지(Phase 5 ↔ Phase 4 연결) 직접 실행해 확인
+   - 모니터링 화면에 재고 여유/부족/고갈 3단계가 model_agent의 판정 API 값 그대로 표시되는지 확인
+   - 그 외 메뉴별 입력값·상태 전이 문구가 PDF 명세와 어긋나지 않는지 재확인
