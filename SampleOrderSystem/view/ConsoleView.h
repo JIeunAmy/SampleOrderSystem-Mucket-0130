@@ -22,6 +22,16 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
+
 #include "model/Order.h"
 #include "model/MonitoringService.h"
 #include "model/Sample.h"
@@ -30,6 +40,18 @@
 class ConsoleView
 {
 public:
+    // Windows 콘솔의 기본 코드페이지(CP949 등)로 인해 UTF-8로 컴파일된 한글
+    // 문자열이 깨져 보이는 문제를 막기 위해, 어떤 콘솔 출력이 발생하기 전에
+    // 콘솔 입출력 코드페이지를 UTF-8(CP_UTF8)로 전환한다.
+    // Windows 외 플랫폼에서는 아무 동작도 하지 않는다.
+    ConsoleView()
+    {
+#if defined(_WIN32)
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+#endif
+    }
+
     // ---------------- 메인 메뉴 ----------------
 
     void ShowMainMenu()
