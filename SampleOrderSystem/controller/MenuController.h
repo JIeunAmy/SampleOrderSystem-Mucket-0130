@@ -158,7 +158,7 @@ private:
     {
         std::string id = view_.ReadSampleId();
         std::string name = view_.ReadSampleName();
-        int avgProductionTime = view_.ReadAvgProductionTime();
+        double avgProductionTime = view_.ReadAvgProductionTime();
         double yieldRate = view_.ReadYieldRate();
         int initialStock = view_.ReadInitialStock();
 

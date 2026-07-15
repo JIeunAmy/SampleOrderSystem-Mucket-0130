@@ -356,7 +356,7 @@ namespace data
             {
                 std::string id = obj.count("sampleId") ? obj.at("sampleId") : "";
                 std::string name = obj.count("name") ? obj.at("name") : "";
-                int avgProductionTime = obj.count("avgProductionTime") ? std::stoi(obj.at("avgProductionTime")) : 0;
+                double avgProductionTime = obj.count("avgProductionTime") ? std::stod(obj.at("avgProductionTime")) : 0.0;
                 double yieldRate = obj.count("yieldRate") ? std::stod(obj.at("yieldRate")) : 0.0;
                 int stock = obj.count("stock") ? std::stoi(obj.at("stock")) : 0;
                 result.emplace_back(id, name, avgProductionTime, yieldRate, stock);

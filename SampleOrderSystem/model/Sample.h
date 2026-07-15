@@ -14,7 +14,7 @@
 class Sample
 {
 public:
-    Sample(std::string id, std::string name, int avgProductionTime, double yieldRate, int initialStock = 0)
+    Sample(std::string id, std::string name, double avgProductionTime, double yieldRate, int initialStock = 0)
         : id_(std::move(id)), name_(std::move(name)), avgProductionTime_(avgProductionTime),
           yieldRate_(yieldRate), stock_(initialStock)
     {
@@ -30,7 +30,7 @@ public:
 
     const std::string& Id() const { return id_; }
     const std::string& Name() const { return name_; }
-    int AvgProductionTime() const { return avgProductionTime_; }
+    double AvgProductionTime() const { return avgProductionTime_; }
     double YieldRate() const { return yieldRate_; }
 
     int Stock() const { return stock_; }
@@ -60,7 +60,7 @@ public:
 private:
     std::string id_;
     std::string name_;
-    int avgProductionTime_;
+    double avgProductionTime_;
     double yieldRate_;
     int stock_;
 };

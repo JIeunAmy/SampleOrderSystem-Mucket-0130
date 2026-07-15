@@ -37,7 +37,7 @@ struct ProductionJob
     std::string sampleId;
     int shortage = 0;        // 이 job 등록 시점의 부족분
     int actualQuantity = 0;  // ceil(shortage / sample.YieldRate())
-    int totalMinutes = 0;    // sample.AvgProductionTime() * actualQuantity
+    double totalMinutes = 0.0; // sample.AvgProductionTime() * actualQuantity
     std::chrono::system_clock::time_point startedAt;
     std::chrono::system_clock::time_point expectedEndAt; // startedAt + totalMinutes(분)
 };
@@ -105,7 +105,7 @@ public:
                 {
                     ProductionJob& next = queue.front();
                     next.startedAt = now;
-                    next.expectedEndAt = now + std::chrono::minutes(next.totalMinutes);
+                    next.expectedEndAt = now + MinutesToDuration(next.totalMinutes);
                 }
 
                 progressed = true;
@@ -174,8 +174,8 @@ public:
             job.actualQuantity = state.actualQuantity;
             job.startedAt = ParseTimePoint(state.productionStartAt);
             job.expectedEndAt = ParseTimePoint(state.productionEndAt);
-            job.totalMinutes = static_cast<int>(
-                std::chrono::duration_cast<std::chrono::minutes>(job.expectedEndAt - job.startedAt).count());
+            job.totalMinutes =
+                std::chrono::duration<double, std::ratio<60>>(job.expectedEndAt - job.startedAt).count();
 
             queues_[job.sampleId].push_back(job);
         }
@@ -217,11 +217,18 @@ public:
         return static_cast<int>(std::ceil(static_cast<double>(shortage) / yieldRate));
     }
 
+    // 소수점 분(double) 단위를 system_clock::duration으로 정확히 변환한다(초 단위 이하까지 반영).
+    static std::chrono::system_clock::duration MinutesToDuration(double minutes)
+    {
+        return std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::duration<double, std::ratio<60>>(minutes));
+    }
+
 private:
     void StartJob(ProductionJob& job)
     {
         job.startedAt = nowProvider_();
-        job.expectedEndAt = job.startedAt + std::chrono::minutes(job.totalMinutes);
+        job.expectedEndAt = job.startedAt + MinutesToDuration(job.totalMinutes);
     }
 
     NowProvider nowProvider_;

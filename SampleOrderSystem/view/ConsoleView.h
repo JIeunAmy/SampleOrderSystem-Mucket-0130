@@ -108,9 +108,9 @@ public:
         return ReadLine("시료 이름: ");
     }
 
-    int ReadAvgProductionTime()
+    double ReadAvgProductionTime()
     {
-        return ReadInt("평균 생산시간(분): ");
+        return ReadDouble("평균 생산시간(분, 소수점 가능): ");
     }
 
     double ReadYieldRate()
@@ -441,7 +441,7 @@ private:
         std::cout << std::left
                    << std::setw(10) << sample.Id()
                    << std::setw(16) << sample.Name()
-                   << std::setw(14) << sample.AvgProductionTime()
+                   << std::setw(14) << std::fixed << std::setprecision(1) << sample.AvgProductionTime()
                    << std::setw(8) << std::fixed << std::setprecision(2) << sample.YieldRate()
                    << std::setw(8) << sample.Stock() << "\n";
     }

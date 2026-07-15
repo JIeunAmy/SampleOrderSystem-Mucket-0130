@@ -28,6 +28,21 @@
 //   };
 //
 // 위 시그니처는 model_agent와 조율 대상이며, 구현 시 변경이 필요하면 이 테스트를 함께 갱신한다.
+//
+// 2026-07-15 요구사항 변경(Red): avgProductionTime은 분(minute) 단위이며 소수점 값을 허용해야 한다.
+// 현재 구현은 `int avgProductionTime`이라 소수점 값을 넘기면 잘려서 저장된다(예: 12.5 -> 12).
+// model_agent는 아래와 같이 시그니처를 변경해야 한다:
+//
+//   class Sample {
+//   public:
+//       Sample(std::string id, std::string name, double avgProductionTime, double yieldRate,
+//              int initialStock = 0);
+//       double AvgProductionTime() const; // 소수점 값을 그대로 보존해 반환
+//       ...
+//   };
+//
+// 이 변경은 produce/ProductionLine.h의 ProductionJob::totalMinutes(현재 int)도 double로 함께
+// 바꿔야 함을 의미한다(자세한 내용은 ProductionLineTests.cpp 상단 주석 참고).
 
 #include "catch_amalgamated.hpp"
 #include "model/Sample.h"
@@ -184,4 +199,47 @@ TEST_CASE("SampleRepository는 중복된 시료 ID 등록을 거부한다", "[Sa
 
     Sample duplicate("S-030", "AnotherName", 20, 0.5);
     REQUIRE_THROWS_AS(repo.Register(duplicate), std::invalid_argument);
+}
+
+TEST_CASE("Sample은 평균 생산시간에 소수점 값을 허용하고 정확히 보존한다", "[Sample][avgProductionTime][double]")
+{
+    SECTION("일반적인 소수점 값(12.5)은 잘리지 않고 그대로 보존된다")
+    {
+        Sample sample("S-060", "TestSample", 12.5, 0.9);
+        REQUIRE(sample.AvgProductionTime() == Catch::Approx(12.5));
+    }
+
+    SECTION("1분 미만의 소수점 값(0.5)도 그대로 보존된다")
+    {
+        Sample sample("S-061", "TestSample", 0.5, 0.9);
+        REQUIRE(sample.AvgProductionTime() == Catch::Approx(0.5));
+    }
+
+    SECTION("정수처럼 보이는 값(10)을 넘겨도 하위 호환으로 정상 동작한다")
+    {
+        Sample sample("S-062", "TestSample", 10, 0.9);
+        REQUIRE(sample.AvgProductionTime() == Catch::Approx(10.0));
+    }
+
+    SECTION("소수점 두 자리(15.75)까지도 정확히 보존된다")
+    {
+        Sample sample("S-063", "TestSample", 15.75, 0.9);
+        REQUIRE(sample.AvgProductionTime() == Catch::Approx(15.75));
+    }
+}
+
+TEST_CASE("SampleRepository는 등록되지 않은 시료 ID를 Find하면 예외를 던진다", "[SampleRepository][Find][unregistered]")
+{
+    // 생산 큐 등록(ProductionLine::Enqueue)은 항상 SampleRepository에서 조회한 Sample을 넘기는
+    // 방식으로 설계되었으므로(요구사항: 등록되지 않은 시료는 생산 불가), Find가 미등록 id에 대해
+    // 예외를 던지는 것이 그 안전장치의 근거가 된다.
+    SampleRepository repo;
+    Sample sample("S-070", "TestSample", 10, 0.9);
+    repo.Register(sample);
+
+    REQUIRE_FALSE(repo.Contains("S-999"));
+    REQUIRE_THROWS_AS(repo.Find("S-999"), std::out_of_range);
+
+    const SampleRepository& constRepo = repo;
+    REQUIRE_THROWS_AS(constRepo.Find("S-999"), std::out_of_range);
 }

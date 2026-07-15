@@ -90,6 +90,143 @@
 - Red 확인: `msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행 결과 72개 컴파일 오류(`data` 네임스페이스 및 `SaveSamples`/`LoadSamples`/`SaveOrders`/`LoadOrders`/`SaveOrder`/`SaveProductionState`/`LoadProductionState`/`ProductionState` 미선언) 발생 — `data/Repository.h`가 아직 Phase 0 빈 스텁이므로 예상대로 Red.
 - 다음 단계: data_agent가 위 확정 API대로 `data/Repository.h`(+ 필요 시 `.cpp`)를 구현해 Green 전환. JSON 처리 방식(경량 자체 파서 vs nlohmann/json vendor)은 data_agent가 선택.
 
+## Phase 5 진행 상황 (2026-07-15) — 사용자 요구사항 4건 추가(Red)
+
+사용자가 다음 4가지 요구사항을 추가했다:
+1. `Sample::avgProductionTime`은 분 단위이며 소수점 값을 허용해야 한다(현재 `int` → `double`로 변경 필요).
+2. 생산 완료 후 Sample 재고 증가량은 "실 생산량(actualQuantity)"과 정확히 동일해야 한다.
+3. Repository(영속화)에서 wall-clock 완료 후 재고 증가가 저장/로드 사이클을 거쳐도 유지되어야 한다.
+4. `SampleRepository`에 등록되지 않은 시료는 생산(생산 큐 등록)이 불가능해야 한다.
+
+### 요구사항 1 — avgProductionTime: int → double (Red)
+
+- `model/Sample.h`: 생성자 `Sample(std::string id, std::string name, int avgProductionTime, ...)`와
+  `int AvgProductionTime() const`를 각각 `double avgProductionTime`, `double AvgProductionTime() const`로
+  변경해야 한다. model_agent 담당.
+- `produce/ProductionLine.h`: `ProductionJob::totalMinutes`(현재 `int`)를 `double`로 변경해야 한다.
+  `totalMinutes = sample.AvgProductionTime() * actualQuantity`가 소수점 결과를 낼 수 있으므로(예:
+  0.5*1=0.5, 2.5*4=10.0) `int`로 두면 대입 시 잘려나간다. 또한 `StartJob`/`ProcessCompletions`에서
+  `startedAt + std::chrono::minutes(totalMinutes)`(정수 분 단위)로 `expectedEndAt`을 계산하는 부분도
+  분수 분 단위(예: 0.5분=30초)를 표현할 수 있도록 변경해야 한다 — 제안:
+  `std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::duration<double, std::ratio<60>>(totalMinutes))`.
+  `RestoreState`에서 `totalMinutes`를 `expectedEndAt - startedAt`으로부터 역산하는 부분(현재
+  `std::chrono::duration_cast<std::chrono::minutes>(...).count()`, 정수 분 절삭)도 소수점을 보존하도록
+  `std::chrono::duration<double, std::ratio<60>>`로 캐스팅해야 한다. produce_agent 담당.
+- `data/Repository.h`: `SaveSamples`에서 `s.AvgProductionTime()`을 그대로 출력하는 부분은 변경 불필요(값
+  타입만 double이 되면 스트림 출력이 자동으로 소수점을 포함), `LoadSamples`의
+  `int avgProductionTime = ... std::stoi(...)`를 `double avgProductionTime = ... std::stod(...)`로
+  바꿔야 한다. data_agent 담당.
+- `view/ConsoleView.h`: `int ReadAvgProductionTime()`을 `double ReadAvgProductionTime()`으로 변경(입력
+  파싱을 `std::stod` 등으로). view_agent 담당.
+- `controller/MenuController.h`: `HandleSampleRegistration()`의 `int avgProductionTime = view_.ReadAvgProductionTime();`을
+  `double avgProductionTime = ...;`로 변경. controller_agent 담당.
+- **Red 테스트 추가**:
+  - `SampleOrderSystemTests/SampleTests.cpp`: "Sample은 평균 생산시간에 소수점 값을 허용하고 정확히
+    보존한다" (12.5, 0.5, 정수 10과의 하위 호환, 15.75 네 가지 SECTION).
+  - `SampleOrderSystemTests/RepositoryTests.cpp`: "Sample의 avgProductionTime이 소수점 값이어도 저장 후
+    로드 시 정확히 동일한 값으로 복원된다" (15.75 round-trip).
+  - `SampleOrderSystemTests/ProductionLineTests.cpp`: "avgProductionTime이 소수점 값이면 총 생산 시간도
+    정확한 소수점 값으로 계산된다"(2.5*4=10.0, `expectedEndAt`이 600초 뒤와 정확히 일치하는지까지 확인)와
+    "avgProductionTime이 1분 미만의 소수(0.5분=30초)여도 wall-clock 판정이 초 단위로 정확하다"(29초
+    경과 시 미완료, 30초 경과 시 완료).
+- **Red 확인 결과** (`msbuild ... -t:SampleOrderSystemTests`, 2026-07-15): 컴파일은 경고(C4244,
+  double→int 암묵적 축소 변환) 7건과 함께 **성공**했다(현재 시그니처가 모두 `int`라 `double` 리터럴이
+  암묵적으로 축소 변환되어 컴파일 자체는 깨지지 않음). 테스트 실행 결과 새로 추가한 4개 테스트 케이스가
+  전부 실패(Red)했다: `sample.AvgProductionTime()`이 12.5 대신 12, 0.5 대신 0, 15.75 대신 15를 반환;
+  Repository round-trip도 15.75 대신 15로 복원; `job->totalMinutes`가 10.0 대신 8(=2.5→2로 잘린
+  `AvgProductionTime()` * actualQuantity 4의 정수 연산 결과인 것으로 보임); 0.5분(30초) 케이스는 29초
+  시점에 이미 완료로 판정되어 `stillProducing.empty()`가 실패(0.5가 0으로 잘려 `totalMinutes=0`이 되어
+  즉시 완료 판정된 것). 전체 결과: 52 test cases 중 48 passed / 4 failed, 224 assertions 중 218
+  passed / 6 failed — 예상대로 Red.
+
+### 요구사항 2 — 생산 완료 반영량 = 실 생산량(actualQuantity) 검증
+
+- 기존 `ProductionLineTests.cpp`의 wall-clock 완료 테스트들은 모두 `shortage`와 `actualQuantity`가
+  우연히 일치하는 경우(예: shortage=20, yieldRate=0.5 → actualQuantity=40, 항상 나누어떨어짐)만
+  다루고 있어 "shortage ≠ actualQuantity인 경우에도 재고 증가량이 actualQuantity를 정확히 따르는지"는
+  커버리지가 부족했다.
+- **추가한 테스트**: "실 생산량이 부족분과 다른 경우(나누어떨어지지 않음)에도 재고 증가량은 정확히 실
+  생산량과 일치한다" — shortage=10, yieldRate=0.3 → actualQuantity=ceil(10/0.3)=34(shortage와 다름).
+  생산 완료 후 `samples.Find("S-600").Stock() == 34`(10이 아님)를 검증.
+- **결과**: 이미 Green(현재 `ProductionLine::ProcessCompletions`가 `order.CompleteProduction(sample,
+  current.actualQuantity)`를 호출하므로 shortage가 아닌 actualQuantity가 재고에 반영됨) — 새 테스트는
+  이 계약을 명시적으로 고정(regression lock)하는 역할을 한다. 전체 테스트 실행 결과에서도 이 케이스는
+  실패하지 않았다(위 48 passed 중 하나).
+
+### 요구사항 3 — Repository 영속화 후 재고 증가 확인(통합 시나리오)
+
+- **추가한 테스트**(`ProductionLineTests.cpp`, "영속화 통합" 섹션): "영속화 통합: 만료된 생산 job을
+  저장했다가 새 인스턴스로 복원하면 재고 증가가 저장/로드 사이클을 거쳐도 유지된다".
+  1. Sample(재고 0) + Order(PRODUCING) 생성 후 `ProductionLine::Enqueue`로 생산 큐 등록.
+  2. `ExportState()` + `data::SaveProductionState`, `data::SaveSamples`, `data::SaveOrders`로 저장.
+  3. 완전히 새로운 `SampleRepository`/`OrderRepository`/`ProductionLine` 인스턴스로 `data::LoadSamples`/
+     `data::LoadOrders`/`data::LoadProductionState` 후 `RestoreState`로 복원(재실행 시각은 총 생산
+     시간을 훌쩍 넘긴 시점으로 설정).
+  4. `ProcessCompletions` 호출 후 `Sample::Stock()`이 `actualQuantity`(40)만큼 증가했는지 확인.
+  5. 증가된 재고를 다시 `data::SaveSamples`로 저장 후 `data::LoadSamples`로 재로드해도 40이 정확히
+     유지되는지 확인(영속화 사이클 재검증).
+- **결과**: 이미 Green — data_agent/produce_agent가 이미 구현한 `SaveSamples`/`LoadSamples`/
+  `SaveProductionState`/`LoadProductionState`/`ExportState`/`RestoreState`/`ProcessCompletions`
+  조합이 이 통합 시나리오를 정확히 만족한다. 다만 요구사항 1(avgProductionTime → double)이 반영되면
+  이 테스트에 사용된 `Sample("S-500", "통합테스트시료", 5, 0.5, 0)`의 `5`가 `double`로 암시적 변환되어
+  계속 통과해야 하므로(회귀 없음), 향후 model_agent/produce_agent Green 전환 후에도 재확인이 필요하다.
+
+### 요구사항 4 — 미등록 시료는 생산 불가 (설계 판단, 새 테스트 최소 추가)
+
+- `ProductionLine::Enqueue(const std::string& orderId, const std::string& sampleId, int shortage,
+  const Sample& sample)`는 `Sample` 값 자체를 인자로 받으므로, API 차원에서 "호출자가 로컬에서 즉석으로
+  만든(=SampleRepository에 등록되지 않은) `Sample` 객체"를 넘기는 것을 막을 방법은 없다(한계).
+- 그러나 현재 유일한 실제 호출부(`SampleOrderSystem/controller/MenuController.h:273`)는 항상
+  `samples_.Find(order.SampleId())`의 결과를 그대로 넘긴다. `SampleRepository::Find`는 등록되지 않은
+  id에 대해 `std::out_of_range`를 던지므로(`model/Sample.h`), 등록되지 않은 시료로는 애초에 `Find`
+  단계에서 예외가 발생해 `Enqueue` 호출 자체가 이루어지지 않는다.
+- 또한 생산 큐 등록은 항상 `Order`가 `PRODUCING`으로 전환된 뒤에만 일어나며(`HandleApproval` 흐름),
+  `Order` 생성/승인 이전 단계인 `MenuController::HandleSampleOrder()`(주문 생성)에서 이미
+  `samples_.Contains(sampleId)`를 확인해 등록되지 않은 시료 ID로는 애초에 주문(`RESERVED`) 자체가
+  생성되지 않는다(`SampleOrderSystem/controller/MenuController.h:218`). 즉 "등록되지 않은 시료 주문 생성"
+  →(1차 방어) 및 "등록되지 않은 시료 Enqueue" →(2차 방어, `Find`의 `out_of_range`)가 이중으로 보장된다.
+- **판단**: `ProductionLine::Enqueue`의 시그니처를 `SampleRepository&` + `sampleId`를 받아 내부에서
+  존재 확인 후 예외를 던지는 형태로 바꾸는 방안도 검토했으나, (a) 현재 아키텍처에서 유일한 호출 경로가
+  이미 이중으로 방어되어 있어 실질적 위험이 낮고, (b) 시그니처 변경 시 `ProductionLine`이
+  `SampleRepository`에 대한 의존성을 추가로 갖게 되어 "Sample/Order 클래스 정의에는 관여하지 않는다"는
+  produce_agent 책임 경계가 흐려질 수 있으므로, 시그니처는 변경하지 않기로 판단했다.
+- 이에 따라 새로운 Red 테스트는 추가하지 않되, 이 안전장치의 근거가 되는 `SampleRepository::Find`의
+  예외 동작을 명시적으로 고정하는 테스트를 `SampleTests.cpp`에 추가했다: "SampleRepository는 등록되지
+  않은 시료 ID를 Find하면 예외를 던진다"(const/non-const 오버로드 모두 `std::out_of_range` 확인). 이미
+  구현되어 있으므로 Green(회귀 방지용 규약 고정)이다.
+- **후속 권고**: controller_agent는 `HandleApproval`(생산 큐 등록 지점)에서도 `samples_.Find(...)`
+  호출을 `try/catch`로 감싸거나 사전에 `Contains` 체크를 추가해, 이론상 `Order`에 저장된 `sampleId`가
+  이후 어떤 경로로든 `SampleRepository`에서 사라진 경우(현재 코드에는 삭제 API가 없어 발생하지 않지만)
+  `std::out_of_range`가 처리되지 않은 채 전파되지 않도록 방어적으로 유지할 것을 권고한다(현재 코드는
+  이미 등록 시점에 존재를 보장하므로 필수는 아니나, 향후 시료 삭제 기능이 추가될 경우 재검토 필요).
+
+### 반영된 파일
+
+- `SampleOrderSystemTests/SampleTests.cpp`: 인터페이스 주석에 `avgProductionTime: int → double` 변경
+  공지 추가, "Sample은 평균 생산시간에 소수점 값을 허용하고 정확히 보존한다"(4 SECTION), "SampleRepository는
+  등록되지 않은 시료 ID를 Find하면 예외를 던진다" TEST_CASE 추가.
+- `SampleOrderSystemTests/RepositoryTests.cpp`: "Sample의 avgProductionTime이 소수점 값이어도 저장 후
+  로드 시 정확히 동일한 값으로 복원된다" TEST_CASE 추가.
+- `SampleOrderSystemTests/ProductionLineTests.cpp`: 인터페이스 주석에 `ProductionJob::totalMinutes:
+  int → double` 변경 필요성과 `startedAt`/`expectedEndAt` 소수점 분 계산 방식 제안 추가, `TempFileGuard`
+  헬퍼 추가, 4개 TEST_CASE 추가("avgProductionTime 소수점→총 생산시간", "0.5분(30초) wall-clock 정밀도",
+  "actualQuantity ≠ shortage일 때 재고 증가량", "영속화 통합 시나리오").
+- 세 파일 모두 `SampleOrderSystemTests.vcxproj`에 이미 `ClCompile` 항목으로 등록되어 있어(기존 파일
+  수정만 했으므로) 프로젝트 파일 변경은 불필요했다.
+
+### 다음 단계(Green 전환 담당)
+
+1. model_agent: `model/Sample.h`의 `avgProductionTime` 관련 타입을 `int` → `double`로 변경.
+2. produce_agent: `produce/ProductionLine.h`의 `ProductionJob::totalMinutes`를 `double`로 변경하고,
+   `StartJob`/`ProcessCompletions`/`RestoreState`의 시간 계산을 소수점 분(초 단위 정밀도)까지 지원하도록
+   수정.
+3. data_agent: `data/Repository.h`의 `LoadSamples`에서 `std::stoi` → `std::stod`로 변경.
+4. view_agent: `view/ConsoleView.h`의 `ReadAvgProductionTime()` 반환 타입을 `double`로 변경.
+5. controller_agent: `controller/MenuController.h`의 `avgProductionTime` 지역 변수 타입을 `double`로
+   변경.
+6. 위 변경들이 모두 완료된 뒤 `msbuild ... -t:SampleOrderSystemTests`로 전체 테스트가 Green(198개
+   assertions 이상, 기존 194 + 신규 4개 이상 실패했던 것 포함 전부 통과)이 되는지 재확인한다.
+
 ## Phase 4 진행 상황 (2026-07-15)
 
 - `SampleOrderSystemTests/ProductionLineTests.cpp` 작성 완료, `SampleOrderSystemTests.vcxproj`의 `ClCompile`에 등록 완료.
