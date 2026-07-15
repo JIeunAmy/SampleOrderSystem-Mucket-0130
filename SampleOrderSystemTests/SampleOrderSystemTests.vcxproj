@@ -158,6 +158,7 @@
     <ClCompile Include="OrderTests.cpp" />
     <ClCompile Include="OrderRepositoryTests.cpp" />
     <ClCompile Include="MonitoringTests.cpp" />
+    <ClCompile Include="RepositoryTests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vendor\catch2\catch_amalgamated.hpp" />
