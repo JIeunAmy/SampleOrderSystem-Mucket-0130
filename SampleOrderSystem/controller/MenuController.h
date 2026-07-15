@@ -265,9 +265,22 @@ private:
         if (choice == 1)
         {
             const Sample& sample = samples_.Find(order.SampleId());
-            int shortage = order.Quantity() - sample.Stock();
 
-            order.Approve(sample);
+            bool hasActiveJob = productionLine_.CurrentJob(order.SampleId()).has_value();
+            int availableStock;
+            if (hasActiveJob)
+            {
+                availableStock = 0;
+            }
+            else
+            {
+                std::vector<Order> allOrders = CollectAllOrders();
+                int confirmedQty = SumConfirmedQuantity(allOrders, order.SampleId());
+                availableStock = sample.Stock() - confirmedQty;
+            }
+            int shortage = order.Quantity() - availableStock;
+
+            order.Approve(availableStock);
             if (order.Status() == OrderStatus::PRODUCING)
             {
                 productionLine_.Enqueue(order.Id(), order.SampleId(), shortage, samples_.Find(order.SampleId()));

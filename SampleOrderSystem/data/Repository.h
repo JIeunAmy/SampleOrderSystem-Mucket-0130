@@ -292,19 +292,19 @@ namespace data
             case OrderStatus::CONFIRMED:
             {
                 Sample sufficientStock("__reconstruct__", "__reconstruct__", 1, 1.0, quantity);
-                order.Approve(sufficientStock); // 재고 충분 -> CONFIRMED
+                order.Approve(sufficientStock.Stock()); // 재고 충분 -> CONFIRMED
                 break;
             }
             case OrderStatus::PRODUCING:
             {
                 Sample noStock("__reconstruct__", "__reconstruct__", 1, 1.0, 0);
-                order.Approve(noStock); // 재고 부족 -> PRODUCING (quantity > 0 가정)
+                order.Approve(noStock.Stock()); // 재고 부족 -> PRODUCING (quantity > 0 가정)
                 break;
             }
             case OrderStatus::RELEASE:
             {
                 Sample sufficientStock("__reconstruct__", "__reconstruct__", 1, 1.0, quantity);
-                order.Approve(sufficientStock); // -> CONFIRMED
+                order.Approve(sufficientStock.Stock()); // -> CONFIRMED
                 order.Release(sufficientStock); // -> RELEASE
                 break;
             }

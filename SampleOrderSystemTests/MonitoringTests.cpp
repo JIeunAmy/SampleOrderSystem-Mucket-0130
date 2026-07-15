@@ -6,9 +6,11 @@
 //   enum class StockStatus { SURPLUS, SHORTAGE, DEPLETED }; // 여유 / 부족 / 고갈
 //
 //   // 재고 상태 판정: stock(재고 수량), demand(해당 시료에 대한 미출고 주문 수요 합계)를 받아 3단계로 분류
-//   //  - 고갈(DEPLETED): stock == 0 (demand 값과 무관하게 항상 고갈)
+//   // 2026-07-15 정책 변경(Red): 재고 == 수요 경계값을 SURPLUS에서 DEPLETED로 이동시킴
+//   //  (현재 확정된 수요를 모두 충족하고 나면 재고가 정확히 0이 되어 "곧 고갈될" 상태이므로).
+//   //  - 고갈(DEPLETED): stock == 0 이거나 stock == demand (demand != 0 포함, 즉 stock <= demand 이면서 stock > 0인 경계 포함)
 //   //  - 부족(SHORTAGE): 0 < stock < demand
-//   //  - 여유(SURPLUS):  stock >= demand (demand == 0인 경우도 포함 — 수요가 없으면 항상 여유로 처리)
+//   //  - 여유(SURPLUS):  stock > demand (즉 재고가 수요를 "초과"하는 경우만; demand == 0이고 stock > 0인 경우도 포함)
 //   StockStatus JudgeStockStatus(int stock, int demand);
 //
 //   // 미출고 주문 수요 합계: 특정 sampleId에 대해 확정된 수요만 합산한다. 2026-07-15 변경(Red):
@@ -28,6 +30,14 @@
 //       int release = 0;
 //   };
 //   OrderStatusCounts CountOrdersByStatus(const std::vector<Order>& orders);
+//
+// 2026-07-15 변경(Red, PLAN.md 옵션 B): 주문 승인 시점의 가용 재고(availableStock) 계산을 위해
+// 아래 헬퍼를 새로 추가한다. 특정 sampleId에 대해 CONFIRMED(아직 미출고) 상태 주문들의 수량 합계만
+// 구하는 순수 함수이며, Controller(MenuController::HandleApprovalOrRejection)가
+// `sample.Stock() - SumConfirmedQuantity(allOrders, sampleId)`를 계산해 Order::Approve(int)에
+// 넘길 값을 만드는 데 사용한다.
+//
+//   int SumConfirmedQuantity(const std::vector<Order>& orders, const std::string& sampleId);
 //
 // 위 시그니처는 model_agent와 조율 대상이며, 구현 시 변경이 필요하면 이 테스트를 함께 갱신한다.
 // task 예시에서 조정한 부분:
@@ -56,22 +66,44 @@ TEST_CASE("JudgeStockStatus: 재고가 0이면 항상 고갈(DEPLETED)이다", "
     }
 }
 
+// 2026-07-15 정책 변경(Red): 재고와 수요가 정확히 같으면 현재 확정된 수요를 모두 충족시키고 나면
+// 재고가 정확히 0이 되어 "곧 고갈될" 상태이므로, 더 이상 여유(SURPLUS)가 아니라 고갈(DEPLETED)로 판정한다.
+TEST_CASE("JudgeStockStatus: 재고와 수요가 정확히 같으면 고갈(DEPLETED)이다(경계값 변경)", "[Monitoring][StockStatus][depleted][boundary]")
+{
+    SECTION("재고와 수요가 정확히 같음(0이 아닌 경계값)")
+    {
+        REQUIRE(JudgeStockStatus(10, 10) == StockStatus::DEPLETED);
+    }
+
+    SECTION("재고와 수요가 모두 0이어도 고갈(기존 규칙과 동일하게 유지)")
+    {
+        REQUIRE(JudgeStockStatus(0, 0) == StockStatus::DEPLETED);
+    }
+}
+
 TEST_CASE("JudgeStockStatus: 0 < 재고 < 수요이면 부족(SHORTAGE)이다", "[Monitoring][StockStatus][shortage]")
 {
     REQUIRE(JudgeStockStatus(5, 10) == StockStatus::SHORTAGE);
     REQUIRE(JudgeStockStatus(1, 2) == StockStatus::SHORTAGE);
 }
 
-TEST_CASE("JudgeStockStatus: 재고 >= 수요이면 여유(SURPLUS)이다(경계값 포함)", "[Monitoring][StockStatus][surplus]")
+// 2026-07-15 정책 변경(Red): 재고 == 수요는 더 이상 여유가 아니므로, 여유(SURPLUS)는
+// 재고가 수요를 "초과"하는 경우에만 성립한다.
+TEST_CASE("JudgeStockStatus: 재고 > 수요(초과)이면 여유(SURPLUS)이다", "[Monitoring][StockStatus][surplus]")
 {
-    SECTION("재고가 수요보다 많음")
+    SECTION("재고가 수요보다 많음(초과)")
     {
         REQUIRE(JudgeStockStatus(20, 10) == StockStatus::SURPLUS);
     }
 
-    SECTION("재고와 수요가 정확히 같음(경계값)")
+    SECTION("재고가 수요보다 근소하게 많음(경계값 바로 위)")
     {
-        REQUIRE(JudgeStockStatus(10, 10) == StockStatus::SURPLUS);
+        REQUIRE(JudgeStockStatus(11, 10) == StockStatus::SURPLUS);
+    }
+
+    SECTION("재고가 10, 수요가 7이면 여유(추가 시나리오)")
+    {
+        REQUIRE(JudgeStockStatus(10, 7) == StockStatus::SURPLUS);
     }
 
     SECTION("수요가 0이고 재고가 0보다 크면 항상 여유")
@@ -95,13 +127,13 @@ TEST_CASE("SumUndeliveredDemand: 특정 시료에 대해 CONFIRMED/PRODUCING 주
 
     // S-001에 대한 CONFIRMED 주문 (수요에 포함되어야 함)
     Order confirmedOrder("O-002", "Bob", "S-001", 4);
-    confirmedOrder.Approve(sample); // 재고 100 >= 4 이므로 CONFIRMED
+    confirmedOrder.Approve(sample.Stock()); // 재고 100 >= 4 이므로 CONFIRMED
     orders.push_back(confirmedOrder);
 
     // 재고 부족 상황을 만들어 PRODUCING 상태의 주문을 별도로 준비 (수요에 포함되어야 함)
     Sample emptySample("S-003", "EmptySample", 10, 0.9);
     Order producingViaShortage("O-003", "Carol", "S-001", 7);
-    producingViaShortage.Approve(emptySample); // emptySample.Stock() == 0 < 7 -> PRODUCING
+    producingViaShortage.Approve(emptySample.Stock()); // emptySample.Stock() == 0 < 7 -> PRODUCING
     orders.push_back(producingViaShortage);
 
     // S-001에 대한 REJECTED 주문 (수요에서 제외되어야 함)
@@ -111,7 +143,7 @@ TEST_CASE("SumUndeliveredDemand: 특정 시료에 대해 CONFIRMED/PRODUCING 주
 
     // S-001에 대한 RELEASE 주문 (수요에서 제외되어야 함)
     Order releasedOrder("O-005", "Eve", "S-001", 50);
-    releasedOrder.Approve(sample); // 재고 충분 -> CONFIRMED
+    releasedOrder.Approve(sample.Stock()); // 재고 충분 -> CONFIRMED
     releasedOrder.Release(sample);
     orders.push_back(releasedOrder);
 
@@ -156,17 +188,17 @@ TEST_CASE("CountOrdersByStatus: REJECTED를 제외하고 상태별 주문 수를
 
     // CONFIRMED 1건 (재고 충분 -> Approve 시 바로 CONFIRMED)
     Order confirmedOrder("O-003", "Carol", "S-001", 1);
-    confirmedOrder.Approve(sample);
+    confirmedOrder.Approve(sample.Stock());
     orders.push_back(confirmedOrder);
 
     // PRODUCING 1건 (재고 부족 -> Approve 시 PRODUCING)
     Order producingOrder("O-004", "Dave", "S-002", 1);
-    producingOrder.Approve(emptySample);
+    producingOrder.Approve(emptySample.Stock());
     orders.push_back(producingOrder);
 
     // RELEASE 1건
     Order releasedOrder("O-005", "Eve", "S-001", 1);
-    releasedOrder.Approve(sample);
+    releasedOrder.Approve(sample.Stock());
     releasedOrder.Release(sample);
     orders.push_back(releasedOrder);
 
@@ -197,4 +229,43 @@ TEST_CASE("CountOrdersByStatus: 빈 목록이면 모든 카운트가 0이다", "
     REQUIRE(counts.confirmed == 0);
     REQUIRE(counts.producing == 0);
     REQUIRE(counts.release == 0);
+}
+
+// 2026-07-15 추가(Red, PLAN.md 옵션 B): SumConfirmedQuantity - 같은 시료에 대해 CONFIRMED 주문이
+// 2건 이상 겹쳐 있을 때 그 수량 합계가 정확히 계산되는지 검증한다(PLAN.md 예시 A의 확장 케이스).
+TEST_CASE("SumConfirmedQuantity: 같은 시료의 CONFIRMED 주문 수량을 모두 합산한다", "[Monitoring][confirmed][PLAN]")
+{
+    Sample sample("S-001", "TestSample", 10, 0.9);
+    sample.IncreaseStock(200);
+
+    std::vector<Order> orders;
+
+    // S-001에 대한 CONFIRMED 주문 2건 (수량 80, 30 -> 합계 110)
+    Order confirmedA("O-101", "Alice", "S-001", 80);
+    confirmedA.Approve(sample.Stock()); // 재고 200 >= 80 -> CONFIRMED
+    orders.push_back(confirmedA);
+
+    Order confirmedB("O-102", "Bob", "S-001", 30);
+    confirmedB.Approve(sample.Stock()); // 재고 200 >= 30 -> CONFIRMED
+    orders.push_back(confirmedB);
+
+    // RESERVED 주문은 합산에서 제외되어야 함
+    orders.emplace_back("O-103", "Carol", "S-001", 999);
+
+    // 다른 시료의 CONFIRMED 주문은 합산에서 제외되어야 함
+    Sample other("S-002", "OtherSample", 5, 0.8);
+    other.IncreaseStock(50);
+    Order confirmedOther("O-104", "Dave", "S-002", 40);
+    confirmedOther.Approve(other.Stock());
+    orders.push_back(confirmedOther);
+
+    REQUIRE(SumConfirmedQuantity(orders, "S-001") == 110);
+}
+
+TEST_CASE("SumConfirmedQuantity: 해당 시료의 CONFIRMED 주문이 없으면 0을 반환한다", "[Monitoring][confirmed][edge]")
+{
+    std::vector<Order> orders;
+    orders.emplace_back("O-110", "Alice", "S-001", 5); // RESERVED
+
+    REQUIRE(SumConfirmedQuantity(orders, "S-001") == 0);
 }

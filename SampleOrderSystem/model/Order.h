@@ -41,14 +41,14 @@ public:
     int Quantity() const { return quantity_; }
     OrderStatus Status() const { return status_; }
 
-    void Approve(const Sample& sample)
+    void Approve(int availableStock)
     {
         if (status_ != OrderStatus::RESERVED)
         {
             throw std::logic_error("Order can only be approved from RESERVED status");
         }
 
-        status_ = (sample.Stock() >= quantity_) ? OrderStatus::CONFIRMED : OrderStatus::PRODUCING;
+        status_ = (availableStock >= quantity_) ? OrderStatus::CONFIRMED : OrderStatus::PRODUCING;
     }
 
     void Reject()

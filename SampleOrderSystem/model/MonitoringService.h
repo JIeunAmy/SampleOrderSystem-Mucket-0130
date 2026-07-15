@@ -17,12 +17,12 @@ enum class StockStatus
 };
 
 // 재고 상태 판정
-//  - 고갈(DEPLETED): stock == 0 (demand 값과 무관하게 항상 고갈)
+//  - 고갈(DEPLETED): stock == 0, 또는 stock == demand (stock != 0)
 //  - 부족(SHORTAGE): 0 < stock < demand
-//  - 여유(SURPLUS):  stock >= demand (demand == 0인 경우도 포함)
+//  - 여유(SURPLUS):  stock > demand
 inline StockStatus JudgeStockStatus(int stock, int demand)
 {
-    if (stock == 0)
+    if (stock == 0 || stock == demand)
     {
         return StockStatus::DEPLETED;
     }
@@ -57,6 +57,28 @@ inline int SumUndeliveredDemand(const std::vector<Order>& orders, const std::str
             break;
         default:
             break;
+        }
+    }
+
+    return total;
+}
+
+// 확정(CONFIRMED) 수량 합계: 특정 sampleId에 대해 CONFIRMED 상태 주문의
+// 수량(Quantity())을 모두 합산한다. (다른 상태 및 다른 sampleId는 제외)
+inline int SumConfirmedQuantity(const std::vector<Order>& orders, const std::string& sampleId)
+{
+    int total = 0;
+
+    for (const auto& order : orders)
+    {
+        if (order.SampleId() != sampleId)
+        {
+            continue;
+        }
+
+        if (order.Status() == OrderStatus::CONFIRMED)
+        {
+            total += order.Quantity();
         }
     }
 
