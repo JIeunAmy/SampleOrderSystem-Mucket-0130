@@ -21,6 +21,9 @@
     <ClInclude Include="model\Order.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="model\MonitoringService.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
     <ClInclude Include="data\Repository.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
