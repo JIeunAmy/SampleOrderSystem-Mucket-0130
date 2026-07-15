@@ -329,7 +329,23 @@ private:
     {
         std::optional<ProductionJob> currentJob = productionLine_.CurrentJob();
         std::vector<ProductionJob> pendingQueue = productionLine_.PendingQueue();
-        view_.ShowProductionLineStatus(currentJob, pendingQueue);
+
+        std::optional<std::pair<ProductionJob, int>> currentJobWithQty;
+        if (currentJob.has_value())
+        {
+            int qty = orders_.Find(currentJob->orderId).Quantity();
+            currentJobWithQty = std::make_pair(currentJob.value(), qty);
+        }
+
+        std::vector<std::pair<ProductionJob, int>> pendingQueueWithQty;
+        pendingQueueWithQty.reserve(pendingQueue.size());
+        for (const auto& job : pendingQueue)
+        {
+            int qty = orders_.Find(job.orderId).Quantity();
+            pendingQueueWithQty.emplace_back(job, qty);
+        }
+
+        view_.ShowProductionLineStatus(currentJobWithQty, pendingQueueWithQty);
     }
 
     // ---------------- 출고 처리 ----------------

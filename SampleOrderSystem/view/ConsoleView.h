@@ -270,9 +270,8 @@ public:
                    << std::setw(10) << "시료ID"
                    << std::setw(16) << "이름"
                    << std::setw(8) << "재고"
-                   << std::setw(8) << "수요"
                    << std::setw(10) << "상태" << "\n";
-        std::cout << std::string(52, '-') << "\n";
+        std::cout << std::string(44, '-') << "\n";
 
         for (const auto& [sample, demand, status] : sampleDemandStatus)
         {
@@ -280,7 +279,6 @@ public:
                        << std::setw(10) << sample.Id()
                        << std::setw(16) << sample.Name()
                        << std::setw(8) << sample.Stock()
-                       << std::setw(8) << demand
                        << std::setw(10) << StockStatusLabel(status) << "\n";
         }
     }
@@ -288,8 +286,8 @@ public:
     // ---------------- 생산 라인 ----------------
 
     void ShowProductionLineStatus(
-        const std::optional<ProductionJob>& currentJob,
-        const std::vector<ProductionJob>& pendingQueue)
+        const std::optional<std::pair<ProductionJob, int>>& currentJob,
+        const std::vector<std::pair<ProductionJob, int>>& pendingQueue)
     {
         std::cout << "\n---- 현재 생산 중 ----\n";
         if (!currentJob.has_value())
@@ -298,10 +296,12 @@ public:
         }
         else
         {
-            const ProductionJob& job = currentJob.value();
+            const ProductionJob& job = currentJob->first;
+            int orderQuantity = currentJob->second;
             std::cout << "시료 " << job.sampleId
                        << " | 주문 " << job.orderId
                        << " | 실 생산량 " << job.actualQuantity
+                       << " | 주문량 " << orderQuantity
                        << " | 총 생산시간 " << job.totalMinutes << "분"
                        << " | 시작 " << FormatTime(job.startedAt)
                        << " | 완료예정 " << FormatTime(job.expectedEndAt) << "\n";
@@ -318,15 +318,19 @@ public:
                        << std::setw(10) << "순번"
                        << std::setw(10) << "시료ID"
                        << std::setw(10) << "주문ID"
-                       << std::setw(10) << "실생산량" << "\n";
-            std::cout << std::string(40, '-') << "\n";
+                       << std::setw(10) << "실생산량"
+                       << std::setw(10) << "주문량" << "\n";
+            std::cout << std::string(50, '-') << "\n";
             for (std::size_t i = 0; i < pendingQueue.size(); ++i)
             {
+                const ProductionJob& job = pendingQueue[i].first;
+                int orderQuantity = pendingQueue[i].second;
                 std::cout << std::left
                            << std::setw(10) << (i + 1)
-                           << std::setw(10) << pendingQueue[i].sampleId
-                           << std::setw(10) << pendingQueue[i].orderId
-                           << std::setw(10) << pendingQueue[i].actualQuantity << "\n";
+                           << std::setw(10) << job.sampleId
+                           << std::setw(10) << job.orderId
+                           << std::setw(10) << job.actualQuantity
+                           << std::setw(10) << orderQuantity << "\n";
             }
         }
     }
