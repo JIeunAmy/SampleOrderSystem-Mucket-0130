@@ -1,6 +1,6 @@
 # controller_agent 작업 Phase
 
-## Phase 3 — 메뉴 분기 및 Model/Data 연동 (Model/Data API 확정 후 시작)
+## Phase 5 — 메뉴 분기 및 Model/Data/Produce 연동 (Model/Data/Produce API 확정 후 시작)
 
 1. 메인 메뉴 분기 골격 구현 (6개 메뉴)
    - 시료 관리 / 시료 주문 / 주문 승인·거절 / 모니터링 / 생산 라인 / 출고 처리

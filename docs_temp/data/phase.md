@@ -1,6 +1,6 @@
 # data_agent 작업 Phase
 
-## Phase 2 — JSON 영속성 계층 (model_agent의 구조체 정의 확정 후 시작)
+## Phase 3 — JSON 영속성 계층 (model_agent의 구조체 정의 확정 후 시작)
 
 1. Sample/Order 목록을 JSON으로 직렬화/역직렬화하는 함수 구현
    - Model이 정의한 구조체를 그대로 사용, 도메인 로직(상태 전이 규칙, 계산식)은 재구현하지 않음

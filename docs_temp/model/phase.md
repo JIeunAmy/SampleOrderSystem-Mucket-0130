@@ -1,6 +1,6 @@
 # model_agent 작업 Phase
 
-## Phase 1 — 도메인 모델 구현 (Phase 0 골격 확정 후 시작)
+## Phase 2 — 도메인 모델 구현 (Phase 0 골격 확정 후 시작)
 
 1. **Sample**
    - 필드: 시료 ID, 이름, 평균 생산시간, 수율, 재고 수량

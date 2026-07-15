@@ -1,6 +1,6 @@
 # view_agent 작업 Phase
 
-## Phase 4 — 콘솔 입출력 (Controller가 넘길 데이터 형태 확정 후 시작, Phase 3과 병행 가능)
+## Phase 6 — 콘솔 입출력 (Controller가 넘길 데이터 형태 확정 후 시작, Phase 5와 병행 가능)
 
 1. 메인 메뉴 출력 및 입력 프롬프트
 2. 시료 등록/목록/검색 화면 (표 형태, 재고 수량 포함)
