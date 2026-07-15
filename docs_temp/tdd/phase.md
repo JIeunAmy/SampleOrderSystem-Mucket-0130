@@ -695,3 +695,213 @@ assertions 중 12 passed / 4 failed):
    그 시각에 호출되므로 값이 일치). 따라서 회귀 위험은 낮다.
 3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트(기존 회귀 포함, 이번에
    추가한 `[BUG]` 4건 포함)가 Green이 되는지 확인한다.
+
+## Phase 11 진행 상황 (2026-07-15) — 승인 시 재고 클레임(reserved stock) 계산 버그 수정 (Red)
+
+### 배경 — 사용자가 발견한 버그
+
+Phase 8(옵션 B)에서 도입한 `HasJobForSample` 기반 판정("이 시료에 대해 생산 큐(현재 job + 대기열)에
+job이 하나라도 있으면 무조건 가용재고를 0으로 취급")에 새로운 버그가 있었다. 사용자가 보고한 시나리오:
+
+- 시료1 재고 0인 상태에서 주문 A(수량 3)가 승인되어 PRODUCING(availableStock=0, shortage=3=quantity,
+  실 생산량 6)으로 큐에 즉시 등록(currentJob)된다.
+- 이어서 주문 B(수량 3, 같은 시료)도 재고 0인 상태에서 승인되어 마찬가지로 PRODUCING(shortage=3=quantity,
+  실 생산량 6)으로 큐 등록되는데, A가 아직 진행 중이므로 대기열(pendingQueue)에 들어간다.
+- A가 wall-clock 기준으로 완료되어 재고가 6이 되고, A는 CONFIRMED로 전환된다. B는 currentJob으로
+  승격된다.
+- 이 시점에 주문 C(수량 3, 같은 시료)를 승인하면, **C는 현재 재고(6, A의 CONFIRMED 몫 3을 빼도 3)로
+  충분히 CONFIRMED가 될 수 있어야 한다** — B는 shortage==quantity(전량 자체 생산)라서 재고에 대한
+  클레임이 전혀 없기 때문이다. 그런데 기존 코드는 `HasJobForSample("시료1")`이 true(B가 여전히 큐에
+  있으므로)를 반환해 무조건 `availableStock=0`으로 취급, C가 잘못 PRODUCING(생산 큐 등록)이 되어버린다.
+
+### 근본 원인 분석
+
+`shortage`(부족분)가 `quantity`(주문수량)보다 작은 job은 "quantity-shortage"만큼을 **당시의 기존
+재고에서 충당하기로 계획**한 것이라 그 몫만큼 물리 재고에 대한 미확정 클레임을 갖는다. 반면
+`shortage == quantity`인 job은 필요한 전량을 스스로 생산하므로 재고에 대한 클레임이 0이다. 따라서
+"큐에 job이 있는지"가 아니라 "큐에 있는 모든 job의 재고 클레임(quantity-shortage) 합계"를 빼야 한다.
+`quantity-shortage`가 0인 job(전량 자체 생산)은 클레임에 기여하지 않으므로, 그런 job이 큐에 있어도
+새 주문은 정상적으로 현재 재고를 평가받을 수 있다. 반대로 `quantity-shortage > 0`인 job이 있으면
+그 몫만큼은 여전히 새 주문이 가져갈 수 없다 — 기존 Phase 8 "예시 B" 시나리오가 이 케이스에 해당하며
+그 보호는 계속 유지된다.
+
+### 신규 API (`produce/ProductionLine.h`, produce_agent 구현 대상)
+
+```cpp
+// 특정 sampleId에 대해 생산 큐(현재 job + 대기열)에 있는 모든 job들의
+// "재고 클레임"(orders.Find(job.orderId).Quantity() - job.shortage) 합계를 반환한다.
+// orders: 각 job.orderId로 원 주문 수량(Order::Quantity())을 조회하기 위해 필요.
+int SumReservedStockForSample(const std::string& sampleId, OrderRepository& orders) const;
+```
+
+- `currentJob_`과 `pendingQueue_`를 모두 순회하며 `sampleId`가 일치하는 job에 대해서만
+  `orders.Find(job.orderId).Quantity() - job.shortage`를 누적한다(음수가 될 수 없음 — Approve 설계상
+  `shortage = quantity - availableStock`이고 `availableStock >= 0`이므로 항상 `shortage <= quantity`).
+- `HasJobForSample`은 삭제하지 않는다(다른 용도로 계속 사용될 수 있으므로 그대로 유지).
+
+### Controller가 다음 단계에서 구현해야 할 계산식 (인계용)
+
+```cpp
+const Sample& sample = samples_.Find(order.SampleId());
+std::vector<Order> allOrders = CollectAllOrders();
+int confirmedQty = SumConfirmedQuantity(allOrders, order.SampleId());
+int reservedClaim = productionLine_.SumReservedStockForSample(order.SampleId(), orders_);
+int availableStock = sample.Stock() - confirmedQty - reservedClaim;
+int shortage = order.Quantity() - availableStock;
+
+order.Approve(availableStock);
+if (order.Status() == OrderStatus::PRODUCING)
+{
+    productionLine_.Enqueue(order.Id(), order.SampleId(), shortage, samples_.Find(order.SampleId()));
+    SaveProductionState();
+}
+```
+
+더 이상 `bool hasActiveJob = productionLine_.HasJobForSample(order.SampleId());`로 무조건
+`availableStock=0`을 강제하지 않는다 — `SumReservedStockForSample`이 0을 반환하는 경우(모든 큐 job의
+클레임이 0) 자연스럽게 현재 재고가 그대로 평가되고, 클레임이 있는 경우(quantity>shortage인 job이
+있는 경우)만 그만큼 차감되어 결과적으로 Phase 8의 두 시나리오(예시 A/B)를 모두 그대로 만족한다.
+
+### Red 테스트 추가
+
+**`SampleOrderSystemTests/ProductionLineTests.cpp`** (`SumReservedStockForSample` 단위 테스트 5건,
+`[SumReservedStockForSample]` 태그):
+1. "shortage가 quantity보다 작으면 그 차이(재고 클레임)를 반환한다" — quantity=50, shortage=40 →
+   `SumReservedStockForSample == 10`.
+2. "shortage가 quantity와 같으면(전량 자체 생산) 재고 클레임은 0이다 (핵심 버그 케이스)" — quantity=3,
+   shortage=3 → `SumReservedStockForSample == 0`.
+3. "현재 job과 대기열 job의 재고 클레임을 합산한다" — currentJob(quantity=3, shortage=3, 클레임0) +
+   pendingQueue job(quantity=5, shortage=2, 클레임3) → 합계 3.
+4. "해당 sampleId의 job이 전혀 없으면 0을 반환한다" — 빈 큐에서 조회 시 0.
+5. "다른 시료의 job은 합산에서 제외된다" — S-Y에 클레임4짜리 job이 있어도 S-X 조회는 0.
+
+**`SampleOrderSystemTests/ApprovalIntegrationTests.cpp`** (사용자 보고 시나리오 통합 테스트,
+`[Approval][BUG][ReservedStock]` 태그): "사용자 보고 버그: 재고를 전혀 요구하지 않는(shortage==quantity)
+job들이 큐에 있어도, 완료된 선행 job의 실 생산량만큼 늘어난 재고는 새 주문이 정상적으로 평가받을 수
+있어야 한다" — Sample(시료1, yieldRate=0.5, 재고 0) → 주문 A(수량3) 승인(availableStock=0 → PRODUCING,
+shortage=3, 실생산량6, 즉시 시작) → 주문 B(수량3) 승인(availableStock=0 → PRODUCING, shortage=3,
+실생산량6, 대기열행) → FakeClock 기반 별도 `ProductionLine` 인스턴스로 A의 완료를 재현(6분 경과 →
+재고 6, A CONFIRMED, B가 currentJob으로 승격) → 주문 C(수량3) 승인 시 새 계산식으로
+`confirmedQty=3`(A), `reservedClaim=0`(B의 클레임은 0), `availableStock=6-3-0=3`이 되어
+`availableStock(3) >= orderC.Quantity()(3)`이므로 **C가 CONFIRMED로 판정됨을 검증**(기존 버그 코드라면
+`HasJobForSample`이 true라서 강제로 PRODUCING이 되어버릴 부분).
+
+> 참고: 사용자 원본 설명은 "availableStock이 정확히 재고(6)와 같아야 한다"고 표현했으나, PLAN.md
+> 옵션 B의 기존 설계(CONFIRMED 상태 주문도 이미 출고 대기 중인 재고 예약분으로 간주해 차감)를 그대로
+> 유지하면 A가 CONFIRMED로 전환된 시점부터는 A의 수량(3)도 `SumConfirmedQuantity`에 포함되어
+> `availableStock=3`이 정확한 값이다(6이 아님). 두 경우 모두 `availableStock >= 3`이라는 결론(C가
+> CONFIRMED로 판정됨)은 동일하므로, 이번 테스트는 실제로 올바른 값(3)을 기준으로 각 구성요소
+> (`confirmedQty`, `reservedClaim`, 최종 `availableStock`)를 모두 명시적으로 검증하도록 작성했다.
+
+### Red 확인 결과 (2026-07-15)
+
+`msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행
+결과, **8개의 C2039 컴파일 오류**가 발생했다(예상대로 Red) — `'SumReservedStockForSample': 'ProductionLine'의
+멤버가 아닙니다": `ApprovalIntegrationTests.cpp:181, 196, 249`, `ProductionLineTests.cpp:858, 876, 898,
+908, 925`. `produce/ProductionLine.h`에 아직 `SumReservedStockForSample`이 선언되지 않았기 때문이며,
+`HasJobForSample`은 그대로 유지되어 있어 기존 테스트(Phase 8/9/10)는 영향받지 않는다.
+
+### 다음 단계(Green 전환 담당)
+
+1. **produce_agent**: `produce/ProductionLine.h`에 위 확정 시그니처대로
+   `int SumReservedStockForSample(const std::string& sampleId, OrderRepository& orders) const`를
+   추가한다(`currentJob_` + `pendingQueue_` 순회, `orders.Find(job.orderId).Quantity() - job.shortage`
+   누적, sampleId 불일치 job은 제외). `HasJobForSample`은 삭제하지 말고 그대로 유지한다(다른 곳에서
+   재사용될 수 있음).
+2. **controller_agent**: `controller/MenuController.h::HandleApprovalOrRejection()`의 승인(choice==1)
+   분기를 위 "Controller가 다음 단계에서 구현해야 할 계산식"대로 교체한다 —
+   `bool hasActiveJob = productionLine_.HasJobForSample(...)` 기반의 `availableStock=0` 강제 분기를
+   제거하고, `SumConfirmedQuantity` + `productionLine_.SumReservedStockForSample(order.SampleId(),
+   orders_)`를 함께 차감하는 방식으로 교체.
+3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트(Phase 8의 예시 A/B
+   회귀 포함, 이번에 추가한 신규 6건 포함)가 Green이 되는지 확인한다. 특히 Phase 8 "예시 B"/"예시 B
+   확장" 테스트가 여전히 통과하는지(클레임이 있는 job의 보호가 유지되는지) 반드시 재확인할 것.
+
+## Phase 12 진행 상황 (2026-07-15) — shortage 영속화 누락 버그 수정 (Red)
+
+### 배경 — 오케스트레이터가 수동 실행으로 재현 확인한 실제 버그
+
+Phase 11에서 `ProductionLine::SumReservedStockForSample(sampleId, orders)`이 각 job의 "재고 클레임"을
+`orders.Find(job.orderId).Quantity() - job.shortage`로 계산하도록 도입되었다. 그런데
+`ProductionLine::RestoreState()`는 여전히 복원되는 모든 job의 `shortage`를 무조건 0으로 설정한다
+(`job.shortage = 0; // 완료 판정에 불필요, 복원 시 알 수 없으므로 0으로 둔다.` — 이 주석은 Phase 4
+시점에는 맞았으나 Phase 11에서 `SumReservedStockForSample`이 shortage를 실제로 사용하게 되면서 더 이상
+성립하지 않는다). 근본 원인은 `data::ProductionState`(`data/Repository.h`)에 애초에 `shortage` 필드가
+없어 `ProductionLine::ExportState()`가 이를 내보낼 방법이 없다는 점이다.
+
+결과적으로 앱이 재시작되면(`RestoreState` 호출) shortage==quantity(전량 자체 생산, 재고 클레임이
+0이어야 하는) job도 "quantity - 0 = quantity"만큼 클레임을 갖는 것으로 잘못 계산되어, 새 주문의
+availableStock이 부당하게 깎이고 원래 CONFIRMED가 되어야 할 신규 주문이 PRODUCING으로 잘못 판정된다.
+오케스트레이터가 수동 실행으로 이 재시작 시나리오를 재현해 실제 버그임을 확인했다.
+
+### 확정 수정 사항 (인계용, 이번 Red 단계에서는 구현하지 않음)
+
+1. **data_agent**: `data/Repository.h`의 `struct ProductionState`에 `int shortage = 0;` 필드를 추가한다.
+2. **data_agent**: `SaveProductionState`(JSON 직렬화)에 `shortage` 필드를 포함시키고, `LoadProductionState`
+   (역직렬화)에서도 다른 정수 필드(`actualQuantity`)와 동일한 패턴(`obj.count("shortage") ?
+   std::stoi(obj.at("shortage")) : 0`)으로 정확히 복원한다.
+3. **produce_agent**: `ProductionLine::ExportState()`에서 `data::ProductionState`로 변환할 때
+   `state.shortage = job.shortage;`를 추가한다.
+4. **produce_agent**: `ProductionLine::RestoreState()`에서 `job.shortage = 0;` 하드코딩을
+   `job.shortage = state.shortage;`로 변경한다(관련 주석도 더 이상 유효하지 않으므로 함께 갱신 권고).
+
+### Red 테스트 추가
+
+**`SampleOrderSystemTests/RepositoryTests.cpp`**: 인터페이스 주석의 `ProductionState` 구조체에
+`shortage` 필드 추가를 명시. 신규 TEST_CASE "ProductionState의 shortage 필드는 저장 후 다시 로드해도
+정확히 유지된다" — `actualQuantity`와 `shortage`가 서로 다른 값(6, 3)과 극단값(0)을 가진 두 상태를
+저장/로드해 필드가 혼동되지 않고 정확히 복원되는지 확인.
+
+**`SampleOrderSystemTests/ProductionLineTests.cpp`**: 인터페이스 주석의 `ExportState`/`RestoreState`에
+`shortage` 필드 관련 계약 갱신. 신규 TEST_CASE 2건:
+1. "ExportState는 job의 shortage를 data::ProductionState.shortage로 정확히 내보낸다" — shortage(2) !=
+   quantity(5) != actualQuantity(2)로 구성해 필드 혼동 여부까지 검증.
+2. "재시작 복구 후에도 SumReservedStockForSample은 복원 전과 정확히 동일한 값을 반환한다 (핵심 회귀
+   방지)" — currentJob(클레임 0) + pendingQueue job(클레임 3)을 등록해 복원 전 `claimBeforeRestart == 3`을
+   확인한 뒤, `ExportState()` → 새 `ProductionLine` 인스턴스에 `RestoreState()` → 복원 후
+   `SumReservedStockForSample`이 여전히 3을 반환하는지 확인(버그가 있다면 8을 반환하게 됨).
+
+**`SampleOrderSystemTests/ApprovalIntegrationTests.cpp`**: 사용자가 실제로 겪은 재시작 시나리오를
+재현하는 통합 테스트 "사용자 보고 버그(재시작 포함): 재시작(ExportState/RestoreState)을 거쳐도 shortage
+정보가 유실되지 않아 재고 클레임 계산이 정확하게 유지되고, 신규 주문이 정상적으로 CONFIRMED 판정된다"
+(Phase 11 테스트와 동일한 시나리오에 재시작을 필수로 끼워 넣음 — 재시작 없이는 이 버그가 드러나지
+않으므로 이 테스트가 핵심):
+1. 시료1(재고 0, 수율 0.5)에 대해 주문A(수량3) 승인 → availableStock=0 → PRODUCING, shortage=3=quantity,
+   즉시 시작(currentJob), claim=0.
+2. 주문B(수량3, 같은 시료) 승인 → A가 활성이므로 대기열행, availableStock 계산에 `SumReservedStockForSample`
+   포함, A의 클레임 0이므로 shortage_B=3=quantity, claim=0.
+3. `ExportState()`로 상태를 저장한 뒤, **새로운 `ProductionLine` 인스턴스**에 `RestoreState()`로 복원
+   (재시작 시뮬레이션).
+4. 복원된 인스턴스에서 가짜 시계(NowProvider 람다 캡처)를 A의 완료 시각(6분 경과) 이후로 이동시켜
+   `ProcessCompletions()` 호출 → A 완료, 재고 6으로 증가, CONFIRMED 전환, B가 currentJob으로 승격.
+5. 핵심 검증: 주문C(수량3, 같은 시료) 승인 시 `sample.Stock() - SumConfirmedQuantity(...) -
+   productionLine.SumReservedStockForSample(...)`로 계산한 availableStock이 정확히 3(6-3-0)이어야
+   하고, `availableStock >= 3`이므로 C가 CONFIRMED로 판정되어야 한다. `reservedClaimForC == 0`을 명시적으로
+   검증해 재시작을 거쳤음에도 B의 shortage 정보가 유실되지 않았는지 확인한다(버그가 있다면 B의 클레임이
+   3으로 잘못 계산되어 availableStock=0, C가 부당하게 PRODUCING이 된다).
+
+### Red 확인 결과 (2026-07-15)
+
+`msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행
+결과, **5개의 C2039 컴파일 오류**가 발생했다(예상대로 Red) — `'shortage': 'data::ProductionState'의
+멤버가 아닙니다`: `ProductionLineTests.cpp:962`, `RepositoryTests.cpp:344, 352, 362, 366`.
+`data/Repository.h`의 `struct ProductionState`에 아직 `shortage` 필드가 선언되지 않았기 때문이며,
+컴파일이 이 단계에서 실패해 `ApprovalIntegrationTests.cpp`의 신규 통합 테스트를 포함한 전체 테스트
+스위트의 런타임 실행 결과는 이번 빌드에서 확인되지 않았다(컴파일러가 소스 파일 단위로 오류를 보고하므로,
+`ApprovalIntegrationTests.cpp` 자체는 컴파일 오류가 없었으나 같은 프로젝트의 다른 파일이 실패해 링크/실행
+단계까지 도달하지 못했다). 세 파일 모두 기존에 이미 `SampleOrderSystemTests.vcxproj`의 `ClCompile`
+항목에 등록되어 있어(기존 파일 수정만 했으므로) 프로젝트 파일 변경은 불필요했다.
+
+### 다음 단계(Green 전환 담당)
+
+1. **data_agent**: `data/Repository.h`의 `struct ProductionState`에 `int shortage = 0;` 필드를
+   추가하고, `SaveProductionState`/`LoadProductionState`에서 `actualQuantity`와 동일한 패턴으로
+   저장/복원한다.
+2. **produce_agent**: `ProductionLine::ExportState()`에 `state.shortage = job.shortage;`를 추가하고,
+   `ProductionLine::RestoreState()`의 `job.shortage = 0;`을 `job.shortage = state.shortage;`로
+   변경한다(관련 주석 갱신).
+3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트(Phase 11의 5건 포함,
+   이번에 추가한 신규 3건 포함)가 Green이 되는지 확인한다. 특히
+   `ApprovalIntegrationTests.cpp`의 재시작 통합 테스트가 통과하는지(재시작 후에도 `reservedClaimForC == 0`
+   과 `orderC.Status() == OrderStatus::CONFIRMED`가 성립하는지) 반드시 재확인할 것 — data_agent 변경만
+   되고 produce_agent 변경이 누락되면(또는 그 반대) 여전히 Red일 수 있다(두 계층 변경이 함께 필요).

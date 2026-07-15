@@ -27,6 +27,10 @@
 //           std::string productionStartAt;  // ISO 8601 문자열, 예: "2026-07-15T09:00:00"
 //           std::string productionEndAt;    // ISO 8601 문자열
 //           int actualQuantity = 0;
+//           int shortage = 0; // 2026-07-15 추가(Phase 12, Red): job 등록 시점의 부족분. 저장/로드
+//                              // 시 actualQuantity와 동일한 패턴으로 정확히 보존되어야 한다 — 이 값이
+//                              // 유실되면 ProductionLine::RestoreState가 shortage를 알 수 없어
+//                              // SumReservedStockForSample의 재고 클레임 계산이 왜곡된다(버그).
 //       };
 //       void SaveProductionState(const std::vector<ProductionState>& states,
 //                                 const std::string& filePath = kProductionStateFilePath);
@@ -315,4 +319,49 @@ TEST_CASE("ProductionState 목록을 저장 후 다시 로드하면 ISO 8601 시
     REQUIRE(loaded[1].productionStartAt == "2026-07-15T10:31:00");
     REQUIRE(loaded[1].productionEndAt == "2026-07-15T12:01:00");
     REQUIRE(loaded[1].actualQuantity == 5);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2026-07-15 버그 수정(Red, Phase 12): ProductionState에 shortage 필드가 없어
+// ProductionLine::RestoreState가 항상 job.shortage=0으로 복원해버리는 문제(주석 근거가 이제 틀림 —
+// SumReservedStockForSample이 shortage를 실제로 사용하게 되었기 때문). ProductionState에 새 필드
+// `int shortage = 0;`을 추가하고, SaveProductionState/LoadProductionState가 다른 정수 필드
+// (actualQuantity)와 동일한 패턴으로 저장/복원해야 한다.
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("ProductionState의 shortage 필드는 저장 후 다시 로드해도 정확히 유지된다 (Phase 12, shortage 영속화)",
+          "[Repository][ProductionState][roundtrip][shortage][BUG]")
+{
+    TempFileGuard guard("test_production_state_shortage_roundtrip.json");
+
+    std::vector<data::ProductionState> states;
+    // shortage != actualQuantity != 0인 케이스를 포함해 필드가 서로 혼동되지 않는지도 함께 검증한다.
+    data::ProductionState stateA;
+    stateA.orderId = "O-410";
+    stateA.productionStartAt = "2026-07-15T09:00:00";
+    stateA.productionEndAt = "2026-07-15T10:30:00";
+    stateA.actualQuantity = 6;
+    stateA.shortage = 3; // shortage < quantity(원 주문 수량은 여기서 알 수 없으나 임의로 3만 부족했다고 가정)
+    states.push_back(stateA);
+
+    data::ProductionState stateB;
+    stateB.orderId = "O-411";
+    stateB.productionStartAt = "2026-07-15T10:31:00";
+    stateB.productionEndAt = "2026-07-15T12:01:00";
+    stateB.actualQuantity = 6;
+    stateB.shortage = 0; // 전량 자체 생산이 아니라 shortage가 0인(재고로 전부 충당) 극단 케이스
+    states.push_back(stateB);
+
+    data::SaveProductionState(states, guard.path);
+    std::vector<data::ProductionState> loaded = data::LoadProductionState(guard.path);
+
+    REQUIRE(loaded.size() == 2);
+
+    REQUIRE(loaded[0].orderId == "O-410");
+    REQUIRE(loaded[0].actualQuantity == 6);
+    REQUIRE(loaded[0].shortage == 3);
+
+    REQUIRE(loaded[1].orderId == "O-411");
+    REQUIRE(loaded[1].actualQuantity == 6);
+    REQUIRE(loaded[1].shortage == 0);
 }

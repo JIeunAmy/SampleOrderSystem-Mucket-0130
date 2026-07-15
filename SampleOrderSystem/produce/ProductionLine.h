@@ -162,6 +162,32 @@ public:
         return false;
     }
 
+    // 특정 sampleId에 대해 생산 큐(현재 job + 대기열)에 있는 모든 job들의
+    // "재고 클레임"(주문수량 - shortage) 합계를 반환한다.
+    int SumReservedStockForSample(const std::string& sampleId, OrderRepository& orders) const
+    {
+        int total = 0;
+
+        auto accumulate = [&total, &sampleId, &orders](const ProductionJob& job)
+        {
+            if (job.sampleId == sampleId)
+            {
+                total += orders.Find(job.orderId).Quantity() - job.shortage;
+            }
+        };
+
+        if (currentJob_.has_value())
+        {
+            accumulate(currentJob_.value());
+        }
+        for (const auto& job : pendingQueue_)
+        {
+            accumulate(job);
+        }
+
+        return total;
+    }
+
     // 현재 진행 중(current) + 대기(pending) 상태를 모두 data::ProductionState로 변환한다.
     // 리스트의 순서 자체가 FIFO 순서를 나타낸다(첫 번째 항목이 현재 job).
     std::vector<data::ProductionState> ExportState() const
@@ -175,6 +201,7 @@ public:
             state.productionStartAt = FormatTimePoint(job.startedAt);
             state.productionEndAt = FormatTimePoint(job.expectedEndAt);
             state.actualQuantity = job.actualQuantity;
+            state.shortage = job.shortage;
             result.push_back(state);
         };
 
@@ -205,7 +232,8 @@ public:
             ProductionJob job;
             job.orderId = state.orderId;
             job.sampleId = order.SampleId();
-            job.shortage = 0; // 완료 판정에 불필요, 복원 시 알 수 없으므로 0으로 둔다.
+            job.shortage = state.shortage; // 이제 shortage가 정확히 영속화되므로 복원 시에도
+                                            // 재고 클레임(SumReservedStockForSample) 계산이 정확하다.
             job.actualQuantity = state.actualQuantity;
             job.startedAt = ParseTimePoint(state.productionStartAt);
             job.expectedEndAt = ParseTimePoint(state.productionEndAt);

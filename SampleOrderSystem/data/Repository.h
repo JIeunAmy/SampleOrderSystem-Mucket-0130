@@ -8,7 +8,7 @@
 // 저장 스키마:
 // - samples.json          : [{ "sampleId", "name", "avgProductionTime", "yieldRate", "stock" }, ...]
 // - orders.json            : [{ "orderId", "customerName", "sampleId", "quantity", "status" }, ...]
-// - production_state.json  : [{ "orderId", "productionStartAt", "productionEndAt", "actualQuantity" }, ...]
+// - production_state.json  : [{ "orderId", "productionStartAt", "productionEndAt", "actualQuantity", "shortage" }, ...]
 //
 // 주의:
 // - 상태 전이 규칙, 실 생산량/총 생산 시간 계산, wall-clock 완료 판정 등 도메인 로직은
@@ -40,6 +40,7 @@ namespace data
         std::string productionStartAt;  // ISO 8601
         std::string productionEndAt;    // ISO 8601
         int actualQuantity = 0;
+        int shortage = 0;
     };
 
     namespace detail
@@ -458,7 +459,8 @@ namespace data
             oss << "  {\"orderId\":" << detail::ToJsonString(s.orderId)
                 << ",\"productionStartAt\":" << detail::ToJsonString(s.productionStartAt)
                 << ",\"productionEndAt\":" << detail::ToJsonString(s.productionEndAt)
-                << ",\"actualQuantity\":" << s.actualQuantity << "}";
+                << ",\"actualQuantity\":" << s.actualQuantity
+                << ",\"shortage\":" << s.shortage << "}";
             if (i + 1 < states.size())
             {
                 oss << ",";
@@ -484,6 +486,7 @@ namespace data
                 state.productionStartAt = obj.count("productionStartAt") ? obj.at("productionStartAt") : "";
                 state.productionEndAt = obj.count("productionEndAt") ? obj.at("productionEndAt") : "";
                 state.actualQuantity = obj.count("actualQuantity") ? std::stoi(obj.at("actualQuantity")) : 0;
+                state.shortage = obj.count("shortage") ? std::stoi(obj.at("shortage")) : 0;
                 result.push_back(state);
             }
         }

@@ -267,18 +267,10 @@ private:
         {
             const Sample& sample = samples_.Find(order.SampleId());
 
-            bool hasActiveJob = productionLine_.HasJobForSample(order.SampleId());
-            int availableStock;
-            if (hasActiveJob)
-            {
-                availableStock = 0;
-            }
-            else
-            {
-                std::vector<Order> allOrders = CollectAllOrders();
-                int confirmedQty = SumConfirmedQuantity(allOrders, order.SampleId());
-                availableStock = sample.Stock() - confirmedQty;
-            }
+            std::vector<Order> allOrders = CollectAllOrders();
+            int confirmedQty = SumConfirmedQuantity(allOrders, order.SampleId());
+            int reservedClaim = productionLine_.SumReservedStockForSample(order.SampleId(), orders_);
+            int availableStock = sample.Stock() - confirmedQty - reservedClaim;
             int shortage = order.Quantity() - availableStock;
 
             order.Approve(availableStock);
