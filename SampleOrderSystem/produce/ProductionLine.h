@@ -67,7 +67,20 @@ public:
 
         if (!currentJob_.has_value())
         {
-            StartJob(job);
+            job.startedAt = nowProvider_();
+        }
+        else if (pendingQueue_.empty())
+        {
+            job.startedAt = currentJob_->expectedEndAt;
+        }
+        else
+        {
+            job.startedAt = pendingQueue_.back().expectedEndAt;
+        }
+        job.expectedEndAt = job.startedAt + MinutesToDuration(job.totalMinutes);
+
+        if (!currentJob_.has_value())
+        {
             currentJob_ = job;
         }
         else
@@ -106,11 +119,8 @@ public:
 
             if (!pendingQueue_.empty())
             {
-                ProductionJob next = pendingQueue_.front();
+                currentJob_ = pendingQueue_.front();
                 pendingQueue_.pop_front();
-                next.startedAt = now;
-                next.expectedEndAt = now + MinutesToDuration(next.totalMinutes);
-                currentJob_ = next;
             }
             else
             {
@@ -257,12 +267,6 @@ public:
     }
 
 private:
-    void StartJob(ProductionJob& job)
-    {
-        job.startedAt = nowProvider_();
-        job.expectedEndAt = job.startedAt + MinutesToDuration(job.totalMinutes);
-    }
-
     NowProvider nowProvider_;
     std::optional<ProductionJob> currentJob_;
     std::deque<ProductionJob> pendingQueue_;

@@ -598,3 +598,100 @@ public:
    확인한다(`HandleProductionLineStatus`/`ShowProductionLineStatus`는 별도 통합/수동 테스트 대상이며 이
    Repository 파일 자체의 Red/Green 판정에는 영향 없음 — `MenuController`/`ConsoleView`는 TDD 낮음/불필요
    표에 속함).
+
+## Phase 10 진행 상황 (2026-07-15) — Enqueue 시점 대기 job 시각 사전계산 버그 수정 (Red)
+
+### 배경 — 사용자가 발견한 버그
+
+"프로그램을 꺼도 생산 큐는 계속 수행되어야 하는데, 지금은 대기 중인(pending) job의 시작/완료 시각이 그
+job이 실제로 '현재 job'으로 승격되는 순간(`ProcessCompletions` 호출 시점의 `now()`)에야 정해진다."
+
+현재 `produce/ProductionLine.h`의 `Enqueue`는 `currentJob_`이 이미 있으면 새 job을
+`pendingQueue_.push_back(job)`만 하고 `startedAt`/`expectedEndAt`을 전혀 설정하지 않는다(기본 초기화된
+`time_point{}`, 즉 UNIX epoch로 남음). 이 시각은 `ProcessCompletions`에서 해당 job이 대기열 맨 앞으로
+승격되는 순간에야 `next.startedAt = now; next.expectedEndAt = now + MinutesToDuration(...)`로 비로소
+확정된다. 그 결과 "프로그램이 오랫동안(예: 며칠) 꺼져 있다가 재실행되어, 앞선 job은 이미 wall-clock 기준
+완료되었어야 하는" 상황에서도, `ProcessCompletions`가 최소 한 번은 실행되어 앞 job의 완료를 "목격"해야만
+뒤 job의 시작 시각이 그제서야 (재실행된) 지금 시각으로 잡혀버려, 꺼져 있던 시간만큼 뒤 job들의 시계가
+전혀 흐르지 않는 버그가 있었다. 다만 같은 `ProcessCompletions` 호출 내에서 while 루프로 연쇄 완료 자체는
+이미 지원되므로(Phase 9 참고), 이번 버그는 "체인의 각 job이 언제 시작되어야 했는지"가 애초에 잘못
+기록되는 문제이지 연쇄 처리 로직 자체의 결함은 아니다.
+
+### 수정 방향 (다음 단계 produce_agent가 Green으로 전환, 이번 Red 단계에서는 구현하지 않음)
+
+`Enqueue` 시점에 대기열로 들어가는 job의 `startedAt`/`expectedEndAt`을 즉시 계산해 확정한다.
+
+- `currentJob_`도 없고 `pendingQueue_`도 비어있으면: 즉시 시작(`startedAt = nowProvider_()`, 기존과
+  동일, `StartJob` 그대로 사용).
+- `currentJob_`은 있지만 `pendingQueue_`가 비어있으면: 새 job의 `startedAt = currentJob_->expectedEndAt`.
+- `pendingQueue_`에 이미 항목이 있으면: 새 job의 `startedAt = pendingQueue_.back().expectedEndAt`(체인
+  누적).
+- 어느 경우든 `expectedEndAt = startedAt + MinutesToDuration(totalMinutes)`를 즉시 계산해 확정한다.
+- 이에 따라 `ProcessCompletions`에서 다음 job을 승격시킬 때(`pendingQueue_.front()`를 꺼내 `currentJob_`
+  으로 이동시키는 부분) 더 이상 `next.startedAt = now; next.expectedEndAt = now + ...`로 시각을 새로
+  계산할 필요가 없다 — 이미 `Enqueue` 시점에 정확히 계산되어 있으므로 그대로 옮기기만 하면 된다(단, 이
+  변경은 produce_agent의 Green 전환 몫이며 이번 Red 단계 코드에는 반영하지 않았다).
+
+### Red 테스트 추가 (`SampleOrderSystemTests/ProductionLineTests.cpp`)
+
+기존 파일 말미에 `[BUG]` 태그를 붙인 4개 TEST_CASE를 신규 추가했다(파일/프로젝트 변경 없음 — 기존
+`ProductionLineTests.cpp`가 이미 `SampleOrderSystemTests.vcxproj`에 등록되어 있어 별도 등록 불필요).
+
+1. **"Enqueue 시점 시각 사전계산: 대기열에 들어가는 job은 시계를 움직이지 않아도 앞선 job의 종료 예정
+   시각부터 시작하도록 미리 계산된다"** — 가짜 시계를 고정한 채(`clock.AdvanceMinutes` 호출 없이) job
+   A(즉시 시작, total=100분)를 Enqueue한 뒤 곧바로 job B(다른 시료, total=18분)를 Enqueue. `B.startedAt`이
+   `A.expectedEndAt`(=t0+100분)과 정확히 같은지, `B.expectedEndAt`이 `B.startedAt + 18분`과 같은지 검증.
+2. **"Enqueue 시점 시각 사전계산: 대기열이 2개 이상이면 이전 대기 항목의 종료 예정 시각을 이어받는 체인을
+   형성한다"** — A(즉시)→B(대기, total=18분)→C(대기, total=20분) 순서로 Enqueue한 뒤,
+   `C.startedAt == B.expectedEndAt`인지(체인이 누적되는지) 검증.
+3. **"핵심 버그 시나리오: 앱이 오래 꺼져 있다가 재실행되어도 ProcessCompletions 한 번 호출로 밀린 job들이
+   모두 연쇄 완료된다"** — t0에 A(total=10분, 즉시 시작)와 B(total=20분, 대기)를 Enqueue(B는 사전계산상
+   t0+10분에 시작해 t0+30분에 끝나야 함을 먼저 확인). 시계를 **한 번에** t0+35분으로 점프시킨 뒤
+   `ProcessCompletions()`를 딱 한 번 호출 → 완료 목록에 A, B의 주문 ID가 순서대로 모두 포함되고, 각
+   Sample의 재고가 정확히 1씩 증가했는지, `CurrentJob`/`PendingQueue`가 모두 비었는지 검증.
+4. **"핵심 버그 시나리오 + 재시작 복구: 대기 중이던 job의 사전계산된 시각이 저장/복원을 거쳐도 유지되어
+   연쇄 완료된다"** — 3번과 동일하게 A/B를 Enqueue한 뒤 `ExportState()`로 얻은 상태(대기열 항목의
+   `productionStartAt`/`productionEndAt`이 이미 정확한 t0+10분/t0+30분 값을 가져야 함을 먼저 확인)를 새
+   `ProductionLine` 인스턴스에 `RestoreState()`로 복원, 시계를 t0+35분으로 설정한 뒤 `ProcessCompletions()`
+   호출 → A/B 모두 연쇄 완료되는지 검증(3번 시나리오를 재시작을 끼워서 재현).
+
+### Red 확인 결과 (2026-07-15)
+
+`msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 빌드는
+경고/오류 없이 성공(시그니처 변경이 없는 순수 버그 수정 대상이므로 컴파일 자체는 항상 통과). 신규 4개
+TEST_CASE만 필터링해 실행(`SampleOrderSystemTests.exe "[BUG]"`) 결과, **4개 test case 전부 실패**했다(16
+assertions 중 12 passed / 4 failed):
+
+- 테스트 1: `REQUIRE( pending[0].startedAt == current->expectedEndAt )` 실패 — 실제값
+  `1970-01-01T00:00:00Z`(epoch, 미설정) vs 기대값 `2026-07-14T05:13:20Z`(A의 expectedEndAt).
+- 테스트 2: `REQUIRE( pending[1].expectedEndAt == pending[1].startedAt + std::chrono::minutes(20) )` 실패
+  — `pending[1].startedAt`이 epoch로 남아있어 `expectedEndAt`도 epoch(둘 다 미설정이라 우연히 등식은
+  성립하나 그 이전 단계인 `pending[1].startedAt == pending[0].expectedEndAt` 검증에서 이미 실패해야 할
+  값이 epoch로 나온 것이 근본 원인).
+- 테스트 3: `REQUIRE( pendingBeforeJump[0].startedAt == BaseTime() + std::chrono::minutes(10) )` 실패 —
+  실제값 epoch(`1970-01-01T00:00:00Z`) vs 기대값 `2026-07-14T03:43:20Z`(t0+10분).
+- 테스트 4: `REQUIRE( ProductionLine::ParseTimePoint(exported[1].productionStartAt) == BaseTime() +
+  std::chrono::minutes(10) )` 실패 — `ExportState()`가 그대로 epoch를 직렬화해 내보냄.
+
+모두 "대기열에 들어가는 job의 startedAt/expectedEndAt이 Enqueue 시점에 기본값(epoch)으로 남아 있다"는
+동일한 근본 원인에서 비롯된 실패로, 버그를 정확히 재현하는 예상된 Red 결과다.
+
+### 다음 단계(Green 전환 담당)
+
+1. **produce_agent**: `produce/ProductionLine.h::Enqueue`를 위 "수정 방향"대로 변경한다 — 대기열에
+   들어가는 job에 대해서도 `startedAt`/`expectedEndAt`을 즉시 계산해 확정(`currentJob_`이 없으면 즉시
+   시작 로직은 변경 없음; `pendingQueue_`가 비어있으면 `currentJob_->expectedEndAt`, 있으면
+   `pendingQueue_.back().expectedEndAt`을 기준으로 `startedAt` 계산 후 `expectedEndAt` 산출). 대칭으로
+   `ProcessCompletions`에서 다음 job을 승격시킬 때 더 이상 `next.startedAt`/`next.expectedEndAt`을
+   재계산하지 않고(이미 Enqueue 시점에 정확히 계산되어 있음) 그대로 `currentJob_`으로 옮기기만 하도록
+   단순화한다.
+2. 기존 Green 테스트("FIFO: 먼저 등록된 주문이 완료되면 다음 대기 주문이 즉시 시작된다" 등, Phase 4/9에서
+   작성)의 기대값과 이번 수정이 상충하지 않는지 확인 필요 — 검토 결과, 해당 테스트들은 모두
+   `clock.AdvanceMinutes(N)`으로 시계를 정확히 `expectedEndAt`과 일치시킨 뒤 `ProcessCompletions`를
+   호출하므로, "사전계산된 startedAt"과 "완료 판정 시점의 now"가 정확히 같은 값이 되어 결과가 동일하다
+   (예: `"FIFO: 먼저 등록된 주문이 완료되면 다음 대기 주문이 즉시 시작된다"`의
+   `currentAfter->startedAt == BaseTime() + std::chrono::minutes(200)` — O-2의 `startedAt`은 Enqueue
+   시점에 이미 O-1의 `expectedEndAt`(=BaseTime+200분)으로 사전계산되어 있고, `ProcessCompletions`가 정확히
+   그 시각에 호출되므로 값이 일치). 따라서 회귀 위험은 낮다.
+3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트(기존 회귀 포함, 이번에
+   추가한 `[BUG]` 4건 포함)가 Green이 되는지 확인한다.
