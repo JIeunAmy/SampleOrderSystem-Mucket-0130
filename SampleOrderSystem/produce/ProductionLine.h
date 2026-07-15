@@ -1,35 +1,229 @@
 #pragma once
 
-// TODO(Phase 4, produce_agent): ProductionLine 실제 구현 예정.
+// Phase 4 (Produce): ProductionLine - 생산 라인의 FIFO 대기열, 실 생산량/총 생산 시간 계산,
+// wall-clock(실제 경과 시간) 기준 생산 완료 판정을 담당한다.
+// 참고: CLAUDE.md "도메인 모델 및 상태 흐름 > 생산 라인(Production Line)"
 //
-// 이 헤더는 아직 골격(Phase 0) 단계이며, 아래 내용은 이후 단계에서 채워 넣을 설계 개요다.
-// 실제 자료구조/계산 로직/wall-clock 판정 로직은 이번 범위에 포함되지 않는다.
-//
-// 1) FIFO 생산 대기열
-//    - 주문이 들어온 시료만 대기열에 등록되며, 한 번에 하나의 시료만 생산한다.
-//    - std::queue 등을 사용해 선입선출(FIFO) 순서를 보장한다.
-//
-// 2) 생산 큐 등록 API
-//    - 재고 부족으로 PRODUCING 상태가 된 주문을 큐에 등록하는 API를 제공한다.
-//    - 큐에 이미 동일 시료의 생산이 진행 중이면 대기, 아니면 즉시 생산을 시작한다.
-//
-// 3) 실 생산량 계산
-//    - 실 생산량 = ceil(부족분 / 수율(Sample::yield))
-//    - 부족분은 주문 수량 대비 현재 재고를 고려해 model 계층에서 전달받는다.
-//
-// 4) 총 생산 시간 계산
-//    - 총 생산 시간 = 평균 생산시간(Sample::avgProductionTime) * 실 생산량
-//
-// 5) wall-clock 기반 실시간 완료 판정
-//    - std::chrono::system_clock을 사용해 생산 시작 시각과 예상 완료 시각(시작 + 총 생산 시간)을 기록한다.
-//    - 현재 시각이 예상 완료 시각을 지났는지 여부로 생산 완료를 판정한다(프로그램 실행 여부와 무관).
-//    - 생산 시작/완료 예정 시각은 data_agent가 제공하는 Repository API를 통해 영속화한다
-//      (직접 파일 I/O를 구현하지 않는다).
-//
-// 6) 앱 재시작 복구 로직
-//    - 앱 시작 시 저장소에서 진행 중이던 생산 항목을 조회한다.
-//    - 경과 시간이 총 생산 시간을 넘겼다면 즉시 완료 처리하고, model_agent가 제공하는 API를 호출해
-//      해당 주문 상태를 PRODUCING -> CONFIRMED로 전환하고 Sample 재고를 증가시킨다.
-//    - 아직 완료되지 않았다면 남은 시간을 기준으로 계속 대기시킨다.
-//
-// class ProductionLine { ... }; // Phase 4에서 구현
+// - 시료(sampleId)별로 독립된 FIFO 대기열을 유지하며, 각 대기열은 한 번에 하나의 job만 진행한다.
+// - 실 생산량 = ceil(shortage / yieldRate), 총 생산 시간 = avgProductionTime * 실 생산량(분)
+// - 생산 시작/완료 예정 시각은 NowProvider(std::chrono::system_clock 기반)로 얻은 현재 시각을 기준으로
+//   기록하며, ProcessCompletions 호출 시점의 "현재 시각"이 예상 완료 시각을 지났으면 완료로 판정한다.
+//   따라서 프로그램이 종료되었다가 재실행되어도(ExportState/RestoreState를 통해) 실제 경과 시간만큼
+//   생산이 진행된 것으로 취급된다.
+// - Sample/Order 클래스 정의, 상태 전이 규칙, 재고 증감 자체는 model 계층(Sample.h/Order.h)의 책임이며
+//   이 헤더는 그 API(Order::CompleteProduction 등)를 호출만 한다.
+// - JSON 파일 저장/로드는 data_agent가 제공하는 data::ProductionState/SaveProductionState/
+//   LoadProductionState를 사용하며, 이 헤더는 그 스키마에 맞는 변환(ExportState/RestoreState)만 담당한다.
+
+#include <chrono>
+#include <cmath>
+#include <ctime>
+#include <deque>
+#include <functional>
+#include <iomanip>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "model/Order.h"
+#include "model/Sample.h"
+#include "data/Repository.h"
+
+struct ProductionJob
+{
+    std::string orderId;
+    std::string sampleId;
+    int shortage = 0;        // 이 job 등록 시점의 부족분
+    int actualQuantity = 0;  // ceil(shortage / sample.YieldRate())
+    int totalMinutes = 0;    // sample.AvgProductionTime() * actualQuantity
+    std::chrono::system_clock::time_point startedAt;
+    std::chrono::system_clock::time_point expectedEndAt; // startedAt + totalMinutes(분)
+};
+
+class ProductionLine
+{
+public:
+    using NowProvider = std::function<std::chrono::system_clock::time_point()>;
+
+    explicit ProductionLine(NowProvider nowProvider = [] { return std::chrono::system_clock::now(); })
+        : nowProvider_(std::move(nowProvider))
+    {
+    }
+
+    // 주문을 생산 큐에 등록한다. 동일 sampleId의 생산이 진행 중이 아니면 즉시 시작하고,
+    // 진행 중이면 FIFO 대기열에만 추가한다.
+    void Enqueue(const std::string& orderId, const std::string& sampleId, int shortage, const Sample& sample)
+    {
+        ProductionJob job;
+        job.orderId = orderId;
+        job.sampleId = sampleId;
+        job.shortage = shortage;
+        job.actualQuantity = ComputeActualQuantity(shortage, sample.YieldRate());
+        job.totalMinutes = sample.AvgProductionTime() * job.actualQuantity;
+
+        auto& queue = queues_[sampleId];
+        bool shouldStartNow = queue.empty();
+        if (shouldStartNow)
+        {
+            StartJob(job);
+        }
+        queue.push_back(job);
+    }
+
+    // 현재 시각 기준으로 완료된 진행 중 job들을 순서대로 처리하고, 완료된 orderId 목록을 반환한다.
+    std::vector<std::string> ProcessCompletions(OrderRepository& orders, SampleRepository& samples)
+    {
+        std::vector<std::string> completedOrderIds;
+        auto now = nowProvider_();
+
+        bool progressed = true;
+        while (progressed)
+        {
+            progressed = false;
+            for (auto& [sampleId, queue] : queues_)
+            {
+                if (queue.empty())
+                {
+                    continue;
+                }
+
+                const ProductionJob& current = queue.front();
+                if (now < current.expectedEndAt)
+                {
+                    continue;
+                }
+
+                Order& order = orders.Find(current.orderId);
+                Sample& sample = samples.Find(sampleId);
+                order.CompleteProduction(sample, current.actualQuantity);
+                completedOrderIds.push_back(current.orderId);
+
+                queue.pop_front();
+                if (!queue.empty())
+                {
+                    ProductionJob& next = queue.front();
+                    next.startedAt = now;
+                    next.expectedEndAt = now + std::chrono::minutes(next.totalMinutes);
+                }
+
+                progressed = true;
+            }
+        }
+
+        return completedOrderIds;
+    }
+
+    // 현재 생산 중인 job 조회 (없으면 nullopt)
+    std::optional<ProductionJob> CurrentJob(const std::string& sampleId) const
+    {
+        auto it = queues_.find(sampleId);
+        if (it == queues_.end() || it->second.empty())
+        {
+            return std::nullopt;
+        }
+        return it->second.front();
+    }
+
+    // FIFO 대기열 조회 (현재 진행 중인 job은 포함하지 않음)
+    std::vector<ProductionJob> PendingQueue(const std::string& sampleId) const
+    {
+        std::vector<ProductionJob> result;
+        auto it = queues_.find(sampleId);
+        if (it == queues_.end() || it->second.size() <= 1)
+        {
+            return result;
+        }
+        result.assign(it->second.begin() + 1, it->second.end());
+        return result;
+    }
+
+    // 현재 진행 중(current) + 대기(pending) 상태를 모두 data::ProductionState로 변환한다.
+    std::vector<data::ProductionState> ExportState() const
+    {
+        std::vector<data::ProductionState> result;
+        for (const auto& [sampleId, queue] : queues_)
+        {
+            for (const auto& job : queue)
+            {
+                data::ProductionState state;
+                state.orderId = job.orderId;
+                state.productionStartAt = FormatTimePoint(job.startedAt);
+                state.productionEndAt = FormatTimePoint(job.expectedEndAt);
+                state.actualQuantity = job.actualQuantity;
+                result.push_back(state);
+            }
+        }
+        return result;
+    }
+
+    // states의 각 orderId로 orders에서 sampleId를 조회해 sample별 current/pending 대기열을 재구성한다.
+    // vector 내 순서를 FIFO 순서로 간주한다(같은 sampleId 중 먼저 나온 항목이 current).
+    void RestoreState(const std::vector<data::ProductionState>& states, OrderRepository& orders)
+    {
+        queues_.clear();
+        for (const auto& state : states)
+        {
+            const Order& order = orders.Find(state.orderId);
+
+            ProductionJob job;
+            job.orderId = state.orderId;
+            job.sampleId = order.SampleId();
+            job.shortage = 0; // 완료 판정에 불필요, 복원 시 알 수 없으므로 0으로 둔다.
+            job.actualQuantity = state.actualQuantity;
+            job.startedAt = ParseTimePoint(state.productionStartAt);
+            job.expectedEndAt = ParseTimePoint(state.productionEndAt);
+            job.totalMinutes = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::minutes>(job.expectedEndAt - job.startedAt).count());
+
+            queues_[job.sampleId].push_back(job);
+        }
+    }
+
+    // ISO 8601 (UTC) <-> time_point 변환
+    static std::string FormatTimePoint(std::chrono::system_clock::time_point tp)
+    {
+        std::time_t timeValue = std::chrono::system_clock::to_time_t(tp);
+        std::tm tmValue{};
+#if defined(_WIN32)
+        gmtime_s(&tmValue, &timeValue);
+#else
+        gmtime_r(&timeValue, &tmValue);
+#endif
+        std::ostringstream oss;
+        oss << std::put_time(&tmValue, "%Y-%m-%dT%H:%M:%SZ");
+        return oss.str();
+    }
+
+    static std::chrono::system_clock::time_point ParseTimePoint(const std::string& iso8601)
+    {
+        std::tm tmValue{};
+        std::istringstream iss(iso8601);
+        iss >> std::get_time(&tmValue, "%Y-%m-%dT%H:%M:%SZ");
+
+        std::time_t timeValue;
+#if defined(_WIN32)
+        timeValue = _mkgmtime(&tmValue);
+#else
+        timeValue = timegm(&tmValue);
+#endif
+        return std::chrono::system_clock::from_time_t(timeValue);
+    }
+
+    // 실 생산량 = ceil(shortage / yieldRate)
+    static int ComputeActualQuantity(int shortage, double yieldRate)
+    {
+        return static_cast<int>(std::ceil(static_cast<double>(shortage) / yieldRate));
+    }
+
+private:
+    void StartJob(ProductionJob& job)
+    {
+        job.startedAt = nowProvider_();
+        job.expectedEndAt = job.startedAt + std::chrono::minutes(job.totalMinutes);
+    }
+
+    NowProvider nowProvider_;
+    std::unordered_map<std::string, std::deque<ProductionJob>> queues_;
+};

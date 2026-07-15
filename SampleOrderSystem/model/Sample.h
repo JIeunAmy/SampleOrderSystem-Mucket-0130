@@ -82,6 +82,16 @@ public:
         return samples_.find(id) != samples_.end();
     }
 
+    Sample& Find(const std::string& id)
+    {
+        auto it = samples_.find(id);
+        if (it == samples_.end())
+        {
+            throw std::out_of_range("sample not found: " + id);
+        }
+        return it->second;
+    }
+
     const Sample& Find(const std::string& id) const
     {
         auto it = samples_.find(id);
