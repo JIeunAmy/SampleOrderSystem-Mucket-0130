@@ -143,7 +143,14 @@
     </Manifest>
   </ItemDefinitionGroup>
 
-  <ItemGroup></ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="model\Sample.h" />
+    <ClInclude Include="model\Order.h" />
+    <ClInclude Include="data\Repository.h" />
+    <ClInclude Include="produce\ProductionLine.h" />
+    <ClInclude Include="controller\MenuController.h" />
+    <ClInclude Include="view\ConsoleView.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
