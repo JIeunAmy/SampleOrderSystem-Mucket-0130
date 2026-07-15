@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -266,7 +267,7 @@ private:
         {
             const Sample& sample = samples_.Find(order.SampleId());
 
-            bool hasActiveJob = productionLine_.CurrentJob(order.SampleId()).has_value();
+            bool hasActiveJob = productionLine_.HasJobForSample(order.SampleId());
             int availableStock;
             if (hasActiveJob)
             {
@@ -326,25 +327,9 @@ private:
 
     void HandleProductionLineStatus()
     {
-        std::vector<std::pair<std::string, ProductionJob>> currentJobs;
-        std::vector<std::pair<std::string, std::vector<ProductionJob>>> pendingQueues;
-
-        for (const auto& sampleId : sampleIds_)
-        {
-            auto current = productionLine_.CurrentJob(sampleId);
-            if (current.has_value())
-            {
-                currentJobs.emplace_back(sampleId, current.value());
-            }
-
-            std::vector<ProductionJob> pending = productionLine_.PendingQueue(sampleId);
-            if (!pending.empty())
-            {
-                pendingQueues.emplace_back(sampleId, pending);
-            }
-        }
-
-        view_.ShowProductionLineStatus(currentJobs, pendingQueues);
+        std::optional<ProductionJob> currentJob = productionLine_.CurrentJob();
+        std::vector<ProductionJob> pendingQueue = productionLine_.PendingQueue();
+        view_.ShowProductionLineStatus(currentJob, pendingQueue);
     }
 
     // ---------------- 출고 처리 ----------------

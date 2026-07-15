@@ -288,50 +288,46 @@ public:
     // ---------------- 생산 라인 ----------------
 
     void ShowProductionLineStatus(
-        const std::vector<std::pair<std::string, ProductionJob>>& currentJobs,
-        const std::vector<std::pair<std::string, std::vector<ProductionJob>>>& pendingQueues)
+        const std::optional<ProductionJob>& currentJob,
+        const std::vector<ProductionJob>& pendingQueue)
     {
         std::cout << "\n---- 현재 생산 중 ----\n";
-        if (currentJobs.empty())
+        if (!currentJob.has_value())
         {
-            std::cout << "현재 생산 중인 시료가 없습니다.\n";
+            std::cout << "현재 생산 중인 job이 없습니다.\n";
         }
         else
         {
-            for (const auto& [sampleId, job] : currentJobs)
-            {
-                std::cout << "시료 " << sampleId
-                           << " | 주문 " << job.orderId
-                           << " | 실 생산량 " << job.actualQuantity
-                           << " | 총 생산시간 " << job.totalMinutes << "분"
-                           << " | 시작 " << FormatTime(job.startedAt)
-                           << " | 완료예정 " << FormatTime(job.expectedEndAt) << "\n";
-            }
+            const ProductionJob& job = currentJob.value();
+            std::cout << "시료 " << job.sampleId
+                       << " | 주문 " << job.orderId
+                       << " | 실 생산량 " << job.actualQuantity
+                       << " | 총 생산시간 " << job.totalMinutes << "분"
+                       << " | 시작 " << FormatTime(job.startedAt)
+                       << " | 완료예정 " << FormatTime(job.expectedEndAt) << "\n";
         }
 
         std::cout << "\n---- FIFO 대기열 ----\n";
-        bool anyPending = false;
-        for (const auto& [sampleId, queue] : pendingQueues)
-        {
-            if (queue.empty())
-            {
-                continue;
-            }
-            anyPending = true;
-            std::cout << "시료 " << sampleId << " 대기: ";
-            for (std::size_t i = 0; i < queue.size(); ++i)
-            {
-                std::cout << "[" << queue[i].orderId << " / 수량 " << queue[i].actualQuantity << "]";
-                if (i + 1 < queue.size())
-                {
-                    std::cout << " -> ";
-                }
-            }
-            std::cout << "\n";
-        }
-        if (!anyPending)
+        if (pendingQueue.empty())
         {
             std::cout << "대기 중인 주문이 없습니다.\n";
+        }
+        else
+        {
+            std::cout << std::left
+                       << std::setw(10) << "순번"
+                       << std::setw(10) << "시료ID"
+                       << std::setw(10) << "주문ID"
+                       << std::setw(10) << "실생산량" << "\n";
+            std::cout << std::string(40, '-') << "\n";
+            for (std::size_t i = 0; i < pendingQueue.size(); ++i)
+            {
+                std::cout << std::left
+                           << std::setw(10) << (i + 1)
+                           << std::setw(10) << pendingQueue[i].sampleId
+                           << std::setw(10) << pendingQueue[i].orderId
+                           << std::setw(10) << pendingQueue[i].actualQuantity << "\n";
+            }
         }
     }
 

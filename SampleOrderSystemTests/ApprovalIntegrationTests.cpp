@@ -10,7 +10,7 @@
 //
 // Controller(MenuController::HandleApprovalOrRejection)가 실제로 수행해야 할 계산 순서:
 //   const Sample& sample = samples_.Find(order.SampleId());
-//   bool hasActiveJob = productionLine_.CurrentJob(order.SampleId()).has_value();
+//   bool hasActiveJob = productionLine_.HasJobForSample(order.SampleId());
 //   int availableStock = hasActiveJob
 //       ? 0
 //       : sample.Stock() - SumConfirmedQuantity(CollectAllOrders(), order.SampleId());
@@ -20,6 +20,15 @@
 //
 // 이 테스트 파일은 Controller를 거치지 않고, 위 계산식을 Model/Monitoring/ProductionLine 레벨에서
 // 직접 재현하여 계약을 검증한다(Controller 구현은 다음 단계에서 controller_agent가 담당).
+//
+// ---------------------------------------------------------------------------------------------
+// 2026-07-15 요구사항 변경(Red, `.claude/skills/production/SKILL.md` 참고): ProductionLine이 "전역
+// 단일 생산 슬롯" 구조로 재설계되어 `CurrentJob()`/`PendingQueue()`가 더 이상 sampleId 인자를 받지
+// 않는다. 승인 로직에서 "이 시료가 이미 생산 중인지"를 판정할 때는 `CurrentJob().has_value()`(현재
+// job만 확인)로는 부족하다 — 전역 단일 큐 구조에서는 이 시료의 job이 "대기열에만" 있을 수도 있기
+// 때문이다. 따라서 전역 큐 전체(현재 job + 대기열)에서 해당 sampleId를 조회하는 새 API
+// `bool HasJobForSample(const std::string& sampleId) const`를 사용해야 한다.
+// ---------------------------------------------------------------------------------------------
 
 #include "catch_amalgamated.hpp"
 #include "model/Order.h"
@@ -74,7 +83,8 @@ TEST_CASE("PLAN.md 예시 B: 같은 시료에 활성 PRODUCING job이 있으면 
     productionLine.Enqueue(orderA.Id(), orderA.SampleId(), shortageForA, sample);
 
     // A가 아직 생산 중인 상태에서 주문 B(수량 3) 승인 시도
-    bool hasActiveJob = productionLine.CurrentJob("S-001").has_value();
+    // 전역 단일 슬롯 구조에서도 A는 여전히 CurrentJob이므로 HasJobForSample이 true여야 한다.
+    bool hasActiveJob = productionLine.HasJobForSample("S-001");
     REQUIRE(hasActiveJob);
 
     Order orderB("O-302", "Bob", "S-001", 3);
@@ -85,6 +95,44 @@ TEST_CASE("PLAN.md 예시 B: 같은 시료에 활성 PRODUCING job이 있으면 
     REQUIRE(availableStockForB == 0);
     REQUIRE(orderB.Status() == OrderStatus::PRODUCING);
     REQUIRE(shortageForB == orderB.Quantity());
+    REQUIRE(shortageForB == 3);
+}
+
+TEST_CASE("PLAN.md 예시 B 확장(전역 단일 슬롯 핵심 케이스): 다른 시료가 현재 생산 중이라 이 시료의 job이 "
+          "대기열에만 있어도 HasJobForSample은 true이며 availableStock은 여전히 0으로 취급된다",
+          "[Approval][PLAN][exampleB][GlobalSlot]")
+{
+    // 시료 X가 먼저 생산 중이고, 시료 S-001의 job은 전역 대기열에만 들어가 있는 상황을 재현한다.
+    Sample sampleX("S-X", "다른시료", 10, 1.0);
+    Order orderX("O-X", "Xavier", "S-X", 5);
+    orderX.Approve(0); // stock 0 < 5 -> PRODUCING
+    ProductionLine productionLine;
+    productionLine.Enqueue(orderX.Id(), orderX.SampleId(), 5, sampleX); // 즉시 시작(CurrentJob)
+
+    Sample sample("S-001", "TestSample", 10, 1.0);
+    sample.IncreaseStock(10);
+
+    Order orderA("O-301", "Alice", "S-001", 50);
+    int availableStockForA = sample.Stock(); // 아직 S-001에 대한 job은 없음
+    int shortageForA = orderA.Quantity() - availableStockForA;
+    orderA.Approve(availableStockForA);
+    REQUIRE(orderA.Status() == OrderStatus::PRODUCING);
+
+    // S-X가 CurrentJob이므로 S-001의 job(orderA)은 전역 대기열에만 들어간다.
+    productionLine.Enqueue(orderA.Id(), orderA.SampleId(), shortageForA, sample);
+    REQUIRE(productionLine.CurrentJob().value().sampleId == "S-X");
+
+    // S-001은 지금 당장 CurrentJob이 아니지만(대기열에만 존재), HasJobForSample은 true여야 한다.
+    bool hasActiveJob = productionLine.HasJobForSample("S-001");
+    REQUIRE(hasActiveJob);
+
+    Order orderB("O-302", "Bob", "S-001", 3);
+    int availableStockForB = hasActiveJob ? 0 : sample.Stock();
+    int shortageForB = orderB.Quantity() - availableStockForB;
+    orderB.Approve(availableStockForB);
+
+    REQUIRE(availableStockForB == 0);
+    REQUIRE(orderB.Status() == OrderStatus::PRODUCING);
     REQUIRE(shortageForB == 3);
 }
 
@@ -108,7 +156,7 @@ TEST_CASE("회귀: CONFIRMED 주문도 없고 활성 job도 없으면 availableS
     ProductionLine productionLine;
     std::vector<Order> allOrders; // CONFIRMED 주문 없음
 
-    bool hasActiveJob = productionLine.CurrentJob("S-001").has_value();
+    bool hasActiveJob = productionLine.HasJobForSample("S-001");
     REQUIRE_FALSE(hasActiveJob);
 
     int confirmedQty = SumConfirmedQuantity(allOrders, "S-001");

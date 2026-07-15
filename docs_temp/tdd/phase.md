@@ -458,3 +458,143 @@ Red-Green 루프로 진행한다. 배경(예시 A/B)은 `PLAN.md` 1절 참고.
    재계산).
 3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트(기존 회귀 포함)가
    Green이 되는지 확인한다.
+
+## Phase 9 진행 상황 (2026-07-15) — ProductionLine 전역 단일 생산 슬롯 재설계 (Red)
+
+`.claude/skills/production/SKILL.md`에 문서화된 요구사항: **생산 라인은 제품(시료)에 상관없이 전체
+시스템에서 단 하나의 활성 생산 job만 가질 수 있다.** 서로 다른 시료의 주문이라도 절대 동시에 생산될 수
+없다. FIFO 순서는 시료 종류와 무관하게 도착(등록) 순서를 그대로 보존한다.
+
+### 배경 — 기존 구현의 버그
+
+기존 `produce/ProductionLine.h`는 `std::unordered_map<std::string, std::deque<ProductionJob>> queues_`로
+**시료별 독립 FIFO 큐**를 유지했다. `Enqueue`는 `queues_[sampleId]`가 비어있으면 즉시 시작했는데, 이는
+"이 시료"만 비어있으면 되므로 다른 시료가 이미 생산 중이어도 새 시료는 즉시 시작해버리는 버그였다(하나의
+물리적 생산 라인이라는 도메인 제약을 위반). `controller/MenuController.h::HandleApprovalOrRejection()`도
+`productionLine_.CurrentJob(order.SampleId()).has_value()`로 "이 시료가 현재 생산 중인지"만 확인해,
+"이 시료의 job이 대기열에만 있는" 경우를 놓치는 문제가 있었다.
+
+### 새 확정 API (`produce/ProductionLine.h`, produce_agent 구현 대상)
+
+내부적으로 `std::optional<ProductionJob> currentJob_` 1개 + `std::deque<ProductionJob> pendingQueue_`
+전역 대기열 1개로 재구성한다(더 이상 sampleId를 키로 하는 map을 사용하지 않는다).
+
+```cpp
+class ProductionLine
+{
+public:
+    void Enqueue(const std::string& orderId, const std::string& sampleId, int shortage, const Sample& sample);
+    std::vector<std::string> ProcessCompletions(OrderRepository& orders, SampleRepository& samples);
+    std::optional<ProductionJob> CurrentJob() const;               // sampleId 인자 제거
+    std::vector<ProductionJob> PendingQueue() const;               // sampleId 인자 제거
+    bool HasJobForSample(const std::string& sampleId) const;       // 신규: 전역 큐(current+pending) 전체 조회
+    std::vector<data::ProductionState> ExportState() const;        // 스키마 동일, 순서=FIFO(첫 항목=current)
+    void RestoreState(const std::vector<data::ProductionState>& states, OrderRepository& orders);
+    static std::string FormatTimePoint(std::chrono::system_clock::time_point tp);
+    static std::chrono::system_clock::time_point ParseTimePoint(const std::string& iso8601);
+    static int ComputeActualQuantity(int shortage, double yieldRate);
+};
+```
+
+- **Enqueue**: `currentJob_`이 비어있으면(nullopt) sampleId와 무관하게 즉시 시작. 값이 있으면(다른
+  시료라도) `pendingQueue_` 맨 뒤에 추가만 하고 시작하지 않는다.
+- **ProcessCompletions**: 이제 "전체 map 순회"가 아니라 `currentJob_` 하나만 확인한다. 완료되면
+  `pendingQueue_.front()`를 꺼내 `currentJob_`으로 승격하고 `startedAt=now`로 재설정한다. 연쇄적으로 여러
+  job이 한 번에 완료될 수 있으므로(짧은 job들이 몰려있는 경우) while 루프로 반복 확인해야 한다.
+- **HasJobForSample(sampleId)**: `currentJob_.sampleId == sampleId`이거나 `pendingQueue_` 안에 해당
+  sampleId를 가진 job이 하나라도 있으면 true. Controller가 승인 시 "이 시료가 이미 생산 대기/진행 중인지"
+  판단할 때 사용(대기열까지 봐야 하므로 `CurrentJob().has_value()`만으로는 부족했던 문제를 해결).
+- **ExportState/RestoreState**: 스키마(`data::ProductionState{orderId, productionStartAt, productionEndAt,
+  actualQuantity}`)는 변경 없음. 리스트 순서 자체가 FIFO 순서(첫 번째 항목=currentJob_, 나머지가
+  pendingQueue_ 순서)를 나타내므로 시료별 구분 필드가 없어도 전역 단일 큐 구조를 그대로 왕복할 수 있다.
+
+### Red 테스트 변경/추가 (`SampleOrderSystemTests/ProductionLineTests.cpp`)
+
+- 파일 상단 인터페이스 설계 주석을 새 API(`CurrentJob()`/`PendingQueue()`/`HasJobForSample` 무인자·신규)로
+  전면 갱신.
+- 기존 "서로 다른 시료는 동시에 각각 즉시 생산이 시작될 수 있다" TEST_CASE(잘못된 설계 전제)를 **정반대
+  의미**의 "전역 단일 생산 슬롯: 서로 다른 시료의 주문이라도 현재 job이 있으면 즉시 시작되지 않고
+  대기열에 추가된다"로 교체(핵심 신규 시나리오). 시료 A Enqueue(즉시 시작) → 시료 B Enqueue(대기열행,
+  CurrentJob은 여전히 A) → A가 wall-clock 기준 완료 → CurrentJob이 B로 전환되는지까지 한 번에 검증.
+- 신규 TEST_CASE "FIFO: 서로 다른 시료가 섞여 등록돼도 도착 순서(A, B, A, C)를 그대로 보존해 하나씩
+  처리한다" — 동일 시료(A)의 job이 두 번 등장해도 순서를 앞당기지 않고, 매 1분 경과마다 정확히
+  A1→B1→A2→C1 순서로 완료되는지 검증.
+- 신규 TEST_CASE 2건: "HasJobForSample: 현재 진행 중인 시료는 true, 등록된 적 없는 시료는 false",
+  "HasJobForSample: 대기열에만 있고 지금 당장 CurrentJob은 아닌 시료도 true를 반환한다 (핵심 케이스)".
+- 기존 시나리오(동일 시료 FIFO 대기, FIFO 완료 후 다음 job 시작, wall-clock 미완료/절반경과/정확히
+  경과, 재시작 복구, ISO8601 왕복, avgProductionTime 소수점, actualQuantity≠shortage, Repository
+  영속화 통합)는 `CurrentJob(sampleId)`/`PendingQueue(sampleId)` 호출부만 무인자 형태로 전부 교체하고
+  계산식/계약 자체는 그대로 유지.
+- 신규 TEST_CASE "재시작 복구: 대기열까지 포함해 FIFO 순서가 그대로 보존된다 (전역 단일 큐)" 추가 —
+  서로 다른 시료 A(current)/B(pending)를 `ExportState`한 뒤 새 인스턴스로 `RestoreState`했을 때 순서
+  (첫 항목=A가 current, 두 번째=B가 pending)가 정확히 복원되는지 검증.
+
+### Red 테스트 변경 (`SampleOrderSystemTests/ApprovalIntegrationTests.cpp`)
+
+- 인터페이스 주석의 Controller 계산 순서를 `productionLine_.CurrentJob(order.SampleId()).has_value()`
+  대신 `productionLine_.HasJobForSample(order.SampleId())`를 사용하도록 갱신.
+- "PLAN.md 예시 B" 테스트의 `productionLine.CurrentJob("S-001").has_value()` 호출을
+  `productionLine.HasJobForSample("S-001")`로 교체(같은 시료가 CurrentJob인 케이스이므로 결과는 여전히
+  true, 회귀 없음).
+- 신규 TEST_CASE "PLAN.md 예시 B 확장(전역 단일 슬롯 핵심 케이스): 다른 시료가 현재 생산 중이라 이
+  시료의 job이 대기열에만 있어도 HasJobForSample은 true이며 availableStock은 여전히 0으로 취급된다" —
+  시료 X를 먼저 Enqueue해 CurrentJob으로 만든 뒤, 시료 S-001을 Enqueue하면(대기열행) `CurrentJob().value()
+  .sampleId == "S-X"`이면서도 `HasJobForSample("S-001")`이 true임을 검증. 이는 SKILL.md에서 강조한
+  "현재 job만 확인하고 대기열을 빠뜨리면 안 된다"는 핵심 계약을 명시적으로 고정한다.
+- "회귀: CONFIRMED 주문도 없고 활성 job도 없으면 availableStock은 sample.Stock()과 같다" 테스트의
+  `productionLine.CurrentJob("S-001").has_value()`도 `productionLine.HasJobForSample("S-001")`로 교체.
+
+### Red 확인 결과 (2026-07-15)
+
+`msbuild SampleOrderSystem.slnx -p:Configuration=Debug -p:Platform=x64 -t:SampleOrderSystemTests` 실행
+결과, **31개 컴파일 오류**가 발생했다(예상대로 Red):
+- **C2039** (`HasJobForSample`: `ProductionLine`의 멤버가 아님, 8곳): `ProductionLineTests.cpp` 5곳(신규
+  `HasJobForSample` 테스트 2건 + RestoreState FIFO 순서 테스트 1건에서 사용), `ApprovalIntegrationTests.cpp`
+  3곳(예시 B, 예시 B 확장, 회귀 테스트) — `produce/ProductionLine.h`에 아직 `HasJobForSample`이 선언되지
+  않았기 때문.
+- **C2660** (`CurrentJob`/`PendingQueue`: 함수는 0개의 인수를 사용하지 않음, 23곳): 기존 API가 여전히
+  `CurrentJob(const std::string&)`/`PendingQueue(const std::string&)` 시그니처를 요구하는데 테스트는
+  무인자로 호출하기 때문 — `ProductionLineTests.cpp` 21곳, `ApprovalIntegrationTests.cpp` 1곳(`예시 B
+  확장`의 `CurrentJob().value().sampleId`).
+
+전체 오류 수(31개)는 `produce/ProductionLine.h`가 아직 재설계 전(시료별 독립 큐 + sampleId 인자 필수)
+상태이기 때문이며, produce_agent가 위 확정 API대로 구현을 마치면 전부 해소되어야 한다.
+
+### 다음 단계(Green 전환 담당 — 인계용)
+
+1. **produce_agent**: `produce/ProductionLine.h`를 아래와 같이 재구현한다.
+   - 내부 자료구조를 `std::unordered_map<std::string, std::deque<ProductionJob>> queues_` →
+     `std::optional<ProductionJob> currentJob_` + `std::deque<ProductionJob> pendingQueue_`로 교체.
+   - `Enqueue(orderId, sampleId, shortage, sample)`: `currentJob_`이 없으면 즉시 시작(`StartJob`), 있으면
+     `pendingQueue_.push_back(job)`만 수행(시료 일치 여부와 무관하게 항상 이 분기).
+   - `ProcessCompletions(orders, samples)`: `currentJob_`이 없으면 즉시 반환. 있으면 `now >=
+     currentJob_->expectedEndAt`인 동안 while 루프를 돌며(연쇄 완료 지원) `orders.Find(currentJob_->orderId)
+     .CompleteProduction(samples.Find(currentJob_->sampleId), currentJob_->actualQuantity)` 호출 →
+     완료 orderId 기록 → `pendingQueue_`가 비어있지 않으면 `pendingQueue_.front()`를 꺼내 `startedAt=now`,
+     `expectedEndAt=now+MinutesToDuration(totalMinutes)`로 갱신 후 `currentJob_`으로 승격, 비어있으면
+     `currentJob_ = std::nullopt`로 설정하고 루프 종료.
+   - `CurrentJob() const`: `currentJob_` 그대로 반환.
+   - `PendingQueue() const`: `std::vector<ProductionJob>(pendingQueue_.begin(), pendingQueue_.end())` 반환.
+   - `HasJobForSample(sampleId) const`: `(currentJob_.has_value() && currentJob_->sampleId == sampleId) ||
+     std::any_of(pendingQueue_.begin(), pendingQueue_.end(), [&](const auto& j){ return j.sampleId ==
+     sampleId; })`.
+   - `ExportState() const`: `currentJob_`이 있으면 먼저 push, 이어서 `pendingQueue_`를 순서대로 push(각
+     `ProductionJob` → `data::ProductionState` 변환은 기존과 동일한 필드 매핑).
+   - `RestoreState(states, orders)`: `currentJob_ = std::nullopt; pendingQueue_.clear();` 후 states를
+     순서대로 순회하며 `orders.Find(state.orderId).SampleId()`로 sampleId를 복원해 `ProductionJob`을
+     구성하고, **첫 번째 항목만 `currentJob_`에 대입, 이후 항목은 `pendingQueue_.push_back`**한다(리스트
+     순서=FIFO 순서라는 계약).
+2. **controller_agent**: `controller/MenuController.h`를 다음과 같이 갱신(이번 TDD_Agent 작업 범위 아님,
+   다음 단계에서 함께 진행):
+   - `HandleApprovalOrRejection()`의 `bool hasActiveJob = productionLine_.CurrentJob(order.SampleId())
+     .has_value();`를 `bool hasActiveJob = productionLine_.HasJobForSample(order.SampleId());`로 교체.
+   - `HandleProductionLineStatus()`를 전면 재작성해야 한다. 기존 코드는 `sampleIds_`를 순회하며 시료별로
+     `CurrentJob(sampleId)`/`PendingQueue(sampleId)`를 조회했으나, 새 API는 전역 단일
+     `CurrentJob()`(job 1개 또는 없음)과 전역 `PendingQueue()`(여러 시료가 섞인 리스트)만 제공한다.
+     `view/ConsoleView.h::ShowProductionLineStatus`의 시그니처도 "시료별 목록"에서 "전역 현재 job 1개(
+     optional) + 전역 대기열 목록"으로 바뀌어야 하므로 view_agent와 시그니처를 재조율해야 한다(SKILL.md
+     "계층별 책임 분리 > View" 참고 — 더 이상 시료별로 나눠 보여줄 필요가 없다).
+3. 위 변경 완료 후 `msbuild ... -t:SampleOrderSystemTests` 재실행으로 전체 테스트가 Green이 되는지
+   확인한다(`HandleProductionLineStatus`/`ShowProductionLineStatus`는 별도 통합/수동 테스트 대상이며 이
+   Repository 파일 자체의 Red/Green 판정에는 영향 없음 — `MenuController`/`ConsoleView`는 TDD 낮음/불필요
+   표에 속함).
